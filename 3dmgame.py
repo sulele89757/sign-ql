@@ -21,6 +21,21 @@ import os
 send_msg = ''
 one_msg = ''
 
+# 3dm 风控引导页特征：未携带（或携带了失效的）yxd_token 时，站点返回一段 156 字节的 JS 代码，
+# 内容为「写入 yxd_token cookie 后跳回原地址」。脚本不执行 JS，若直接解析该页会拿到空结果。
+YXD_TOKEN_RE = re.compile(r"document\.cookie\s*=\s*'yxd_token=([^;']+)")
+
+# 3dm 未登录/掉登录态时返回的 Discuz 提示信息页：正文含该短语且位于 id="messagetext" 提示框内，
+# 两个条件同时成立才判定为掉登录态，避免误伤正文里恰好出现该短语的正常页面（如任务描述、领奖回显）。
+# 短语只取核心片段而不取整句，站点改写后半句时（如「才能进行本操作」）仍能识别。
+NEED_LOGIN_KEYWORD = '您需要先登录'
+NEED_LOGIN_MESSAGE_BOX = 'id="messagetext"'
+
+
+class CookieInvalid(Exception):
+    """cookie 失效或风控无法绕过时抛出，供上层输出明确的失败原因。"""
+
+
 def Log(cont=''):
     global send_msg, one_msg
     if cont:
@@ -61,9 +76,41 @@ class ThreeDMGame:
         self.session = requests.Session()
         self.session.headers.update(headers)
 
+    def _set_cookie(self, name, value):
+        """把单个 cookie 写回会话的 Cookie 请求头，已存在同名项则覆盖，避免出现重复键。"""
+        cookie = self.session.headers.get('Cookie', '')
+        pairs = [p.strip() for p in cookie.split(';') if p.strip() and not p.strip().startswith(f'{name}=')]
+        pairs.append(f'{name}={value}')
+        self.session.headers['Cookie'] = '; '.join(pairs)
+
+    def request(self, method, url, **kwargs):
+        """所有请求的统一入口，负责穿过 3dm 的 yxd_token 风控引导页。
+
+        参数：
+            method：HTTP 方法，'get' 或 'post'
+            url：完整请求地址
+            kwargs：透传给 requests 的其余参数（如 post 的 data）
+        返回：
+            最后一次响应对象；若始终被引导页拦截或页面提示未登录，抛出 CookieInvalid。
+        说明：
+            引导页只能靠 JS 执行，因此这里手工解析其中的 yxd_token 写回 Cookie 头后重试；
+            重试后仍拿不到正常页面说明 cookie 已失效，直接报错，避免下游 xpath 静默取空触发 IndexError。
+        """
+        for _ in range(3):
+            response = self.session.request(method, url, **kwargs)
+            token = YXD_TOKEN_RE.search(response.text)
+            if token:
+                self._set_cookie('yxd_token', token.group(1))
+                time.sleep(1)
+                continue
+            if NEED_LOGIN_KEYWORD in response.text and NEED_LOGIN_MESSAGE_BOX in response.text:
+                raise CookieInvalid('cookie 已失效，请重新抓取 bbs3dmck 的 cookie')
+            return response
+        raise CookieInvalid('多次请求仍被 yxd_token 风控页拦截，请稍后重试或更换出口 IP')
+
     def user_info(self):
         try:
-            response = self.session.get('https://bbs.3dmgame.com/home.php?mod=spacecp&ac=credit&showcredit=1')
+            response = self.request('get', 'https://bbs.3dmgame.com/home.php?mod=spacecp&ac=credit&showcredit=1')
             html = etree.HTML(response.text)
             user_id = html.xpath('//*[@id="hd"]/div/div[1]/p/strong/a/text()')[0]
             points = html.xpath('//*[@id="extcreditmenu"]/text()')[0]
@@ -72,11 +119,12 @@ class ThreeDMGame:
             Log(f'\n用户ID：[{user_id}] {points} 金元：{gold}')
         except Exception as e:
             print('3dmgame论坛用户信息获取失败：', e)
-            Log(f'\n3dmgame论坛用户信息获取失败')
+            # 失败原因一并推送到通知，便于区分是 cookie 失效还是页面结构变动
+            Log(f'\n3dmgame论坛用户信息获取失败：{e}')
 
     def task_view(self, t_id):
         try:
-            response = self.session.get(f'https://bbs.3dmgame.com/home.php?mod=task&do=view&id={t_id}')
+            response = self.request('get', f'https://bbs.3dmgame.com/home.php?mod=task&do=view&id={t_id}')
             html = etree.HTML(response.text)
             task_name = html.xpath('//h1[contains(@class, "xs2") and contains(@class, "ptm") and contains(@class, "pbm")]/text()')[0].strip()
             if 'do=apply' in response.text:
@@ -94,7 +142,7 @@ class ThreeDMGame:
 
     def check_task(self):
         try:
-            response = self.session.get('https://bbs.3dmgame.com/home.php?mod=task')
+            response = self.request('get', 'https://bbs.3dmgame.com/home.php?mod=task')
             # print(response.text)
             html = etree.HTML(response.text)
             task_rows = html.xpath('//div[@class="ptm"]//table//tr')
@@ -141,9 +189,9 @@ class ThreeDMGame:
                 for name, link_id in task_list.items():
                     print('*' * 30)
                     print(f'尝试领取任务：{name}')
-                    response = self.session.get(f'https://bbs.3dmgame.com/home.php?mod=task&do=apply&id={link_id}')
+                    response = self.request('get', f'https://bbs.3dmgame.com/home.php?mod=task&do=apply&id={link_id}')
                     if 'do=draw' in response.text:
-                        response = self.session.get(f'https://bbs.3dmgame.com/home.php?mod=task&do=draw&id={link_id}')
+                        response = self.request('get', f'https://bbs.3dmgame.com/home.php?mod=task&do=draw&id={link_id}')
                         if '恭喜您，任务已成功完成，您将收到奖励通知，请注意查收' in response.text:
                             print(f'任务：{name} 直接完成')
                         else:
@@ -171,7 +219,7 @@ class ThreeDMGame:
 
     def check_task_doing(self):
         try:
-            response = self.session.get('https://bbs.3dmgame.com/home.php?mod=task&item=doing')
+            response = self.request('get', 'https://bbs.3dmgame.com/home.php?mod=task&item=doing')
             # print(response.text)
             html = etree.HTML(response.text)
             task_rows = html.xpath('//div[@class="ptm"]//table//tr')
@@ -204,9 +252,9 @@ class ThreeDMGame:
         print(f'获取到{len(tk_list)}个待完成任务')
         for task_name, task_id in tk_list.items():
             print(f'尝试完成任务：《{task_name}》')
-            response = self.session.get(f'https://bbs.3dmgame.com/home.php?mod=task&do=view&id={task_id}')
+            response = self.request('get', f'https://bbs.3dmgame.com/home.php?mod=task&do=view&id={task_id}')
             if 'static/image/task/reward.gif' in response.text:
-                response = self.session.get(f'https://bbs.3dmgame.com/home.php?mod=task&do=draw&id={task_id}')
+                response = self.request('get', f'https://bbs.3dmgame.com/home.php?mod=task&do=draw&id={task_id}')
                 if '恭喜您，任务已成功完成，您将收到奖励通知，请注意查收' in response.text:
                     print(f'任务：《{task_name}》 完成')
                 else:
@@ -214,7 +262,7 @@ class ThreeDMGame:
                     print(response.text)
             elif '完成此任务所需条件' in response.text:
                 print(f'任务：《{task_name}》 无完成条件')
-                response = self.session.get(f'https://bbs.3dmgame.com/home.php?mod=task&do=draw&id={task_id}')
+                response = self.request('get', f'https://bbs.3dmgame.com/home.php?mod=task&do=draw&id={task_id}')
                 if '恭喜您，任务已成功完成，您将收到奖励通知，请注意查收' in response.text:
                     print(f'任务：《{task_name}》 完成')
                 else:
@@ -230,7 +278,7 @@ class ThreeDMGame:
                 # print(reply_td)
                 reply_count = re.search(r'(\d+)次', reply_td).group(1) if re.search(r'(\d+)次', reply_td) else "未知"
                 if 'thread' in tables:
-                    response = self.session.get(f'https://bbs.3dmgame.com/{tables}')
+                    response = self.request('get', f'https://bbs.3dmgame.com/{tables}')
                     formhash = re.search(r'name="formhash" value="(\w+)"', response.text).group(1)
                     fid_match = re.search(r"fid\s*=\s*parseInt\('(\d+)'\)", response.text).group(1)
                     tid_match = re.search(r"tid\s*=\s*parseInt\('(\d+)'\)", response.text).group(1)
@@ -247,10 +295,10 @@ class ThreeDMGame:
                             time.sleep(35)
                     print(f'已完成任务 《{task_name}》 回复指定文章要求')
                 else:
-                    response = self.session.get(f'https://bbs.3dmgame.com/{tables}')
+                    response = self.request('get', f'https://bbs.3dmgame.com/{tables}')
                     result = re.findall(r'mod=redirect&tid=(\d+)&goto', response.text)
                     if len(result) > 0:
-                        response = self.session.get(f'https://bbs.3dmgame.com/thread-{random.choice(result)}-1-1.html')
+                        response = self.request('get', f'https://bbs.3dmgame.com/thread-{random.choice(result)}-1-1.html')
                         formhash = re.search(r'name="formhash" value="(\w+)"', response.text).group(1)
                         fid_match = re.search(r"fid\s*=\s*parseInt\('(\d+)'\)", response.text).group(1)
                         tid_match = re.search(r"tid\s*=\s*parseInt\('(\d+)'\)", response.text).group(1)
@@ -262,7 +310,7 @@ class ThreeDMGame:
                                 time.sleep(10)
                             time.sleep(35)
                     print(f'已完成任务 《{task_name}》 回复指定主题要求')
-                response = self.session.get(f'https://bbs.3dmgame.com/home.php?mod=task&do=draw&id={task_id}')
+                response = self.request('get', f'https://bbs.3dmgame.com/home.php?mod=task&do=draw&id={task_id}')
                 if '恭喜您，任务已成功完成，您将收到奖励通知，请注意查收' in response.text:
                     print(f'任务：《{task_name}》 完成')
                 elif '您已完成该任务的' in response.text:
@@ -293,7 +341,7 @@ class ThreeDMGame:
             'usesig': '1',
             'subject': '  ',
         }
-        response = self.session.post(f'https://bbs.3dmgame.com/forum.php?mod=post&action=reply&fid={fid}&tid={tid}&extra=page%3D1&replysubmit=yes&infloat=yes&handlekey=fastpost&inajax=1', data=data)
+        response = self.request('post', f'https://bbs.3dmgame.com/forum.php?mod=post&action=reply&fid={fid}&tid={tid}&extra=page%3D1&replysubmit=yes&infloat=yes&handlekey=fastpost&inajax=1', data=data)
         if '回复发布成功' in response.text:
             print('回帖成功,等待35秒后回复下个帖子')
             return True
@@ -333,7 +381,12 @@ if __name__ == '__main__':
             for ck in bbs3dmck:
                 print(f'登录第{z}个账号')
                 threeDM = ThreeDMGame(ck)
-                threeDM.main()
+                # 单个账号异常（如 cookie 失效抛 CookieInvalid）只跳过该账号，不影响后续账号
+                try:
+                    threeDM.main()
+                except Exception as e:
+                    print(f'第{z}个账号执行异常：{e}')
+                    Log(f'\n第{z}个账号执行异常：{e}')
                 z+= 1
     except Exception as e:
         print(e)
