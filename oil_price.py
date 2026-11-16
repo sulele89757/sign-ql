@@ -790,8 +790,6 @@ def render(notices: list[dict], cycle: dict, realized: dict, crude: list[dict], 
     add("")
     add("## 窗口日历（后续 %d 天）" % days_ahead)
     add("")
-    add("| 日期 | 星期 | 类型 | 备注 |")
-    add("| --- | --- | --- | --- |")
     cal = WorkCalendar()
     d = today
     for _ in range(days_ahead + 1):
@@ -801,36 +799,35 @@ def render(notices: list[dict], cycle: dict, realized: dict, crude: list[dict], 
         for f in cycle["future"][1:]:
             if d == f:
                 marks.append("预定窗口")
-        add("| %s | %s | %s | %s |" % (
-            d.isoformat(), "一二三四五六日"[d.weekday()],
-            "工作日" if cal.is_workday(d) else "休", "、".join(marks) or "-"))
+        # 用列表而不是四列表格：手机屏宽下表格会被挤成竖条，列表每行一条更易读
+        line = "- **%s（周%s）** %s" % (d.isoformat(), "一二三四五六日"[d.weekday()],
+                                       "工作日" if cal.is_workday(d) else "休")
+        if marks:
+            line += " · " + "、".join(marks)
+        add(line)
         d += dt.timedelta(days=1)
 
     add("")
     add("## 年内调价历史（%s 起，共 %d 次）" % (notices[0]["date"] if notices else "-", len(notices)))
     add("")
-    add("| 公告日 | 方向 | 汽油 | 柴油 | 每升（92# / 95# / 0#） |")
-    add("| --- | --- | --- | --- | --- |")
     for n in notices:
         direction = {"up": "上调", "down": "下调", "control": "调控上调", "hold": "不调"}[n["kind"]]
         if n["kind"] == "hold":
-            real = realized.get(n["date"])
-            est = "%+.2f / - / %+.2f" % (real["gas"], real["diesel"]) if real else "-"
-        else:
-            est = "%.3f / %.3f / %.3f" % (
-                liter_estimate(n["gas"], "92"), liter_estimate(n["gas"], "95"),
-                liter_estimate(n["diesel"], "0"))
-        add("| %s | %s | %s | %s | %s |" % (
+            # 搁浅没有幅度，也不再折算每升，避免出现一排 0 干扰阅读
+            add("- **%s %s**：本次不作调整" % (n["date"], direction))
+            continue
+        est = "92# %.3f、95# %.3f、0# %.3f 元/升" % (
+            liter_estimate(n["gas"], "92"), liter_estimate(n["gas"], "95"),
+            liter_estimate(n["diesel"], "0"))
+        add("- **%s %s**：汽油 %s、柴油 %s 元/吨；%s" % (
             n["date"], direction, fmt_amount(n["gas"]), fmt_amount(n["diesel"]), est))
 
     if crude:
         add("")
         add("## 外盘原油（美元/桶，%s）" % crude[0]["quote_date"])
         add("")
-        add("| 品种 | 最新价 | 涨跌 |")
-        add("| --- | --- | --- |")
         for c in crude:
-            add("| %s | %.2f | %+.2f%% |" % (c["label"], c["price"], c["change_pct"]))
+            add("- %s：%.2f（%+.2f%%）" % (c["label"], c["price"], c["change_pct"]))
 
     add("")
     add("---")
@@ -844,13 +841,28 @@ def render(notices: list[dict], cycle: dict, realized: dict, crude: list[dict], 
 def report_to_html(md: str) -> str:
     """把 render() 产出的 Markdown 报告转成最小 HTML。
 
-    只覆盖 render() 实际用到的语法：一级/二级标题、引用块、无序列表、表格、加粗、
-    分隔线、普通段落。不做通用 Markdown 解析——报告是我们自己拼的，语法集合封闭，
-    这里按行处理足够，也避免引入第三方依赖。
+    只覆盖 render() 实际用到的语法：一级/二级标题、引用块、无序列表、加粗、分隔线、
+    普通段落。不做通用 Markdown 解析——报告是我们自己拼的，语法集合封闭，按行处理足够。
+    样式全部写成行内 style：pushplus 的 html 模板会过滤 <style> 标签，行内样式才生效。
     """
+    # 各元素的行内样式。手机屏宽通常 360~430px，字号取 15px、行高 1.7 较易读；
+    # 段落与列表留出上下间距，避免整块文字糊在一起
+    st_h1 = "font-size:18px;font-weight:600;color:#111;margin:0 0 10px;line-height:1.5"
+    st_h2 = ("font-size:15px;font-weight:600;color:#111;margin:18px 0 8px;padding-left:8px;"
+             "border-left:3px solid #2f6feb;line-height:1.4")
+    st_quote = ("margin:0 0 6px;padding:8px 10px;background:#f5f7fa;border-left:3px solid #2f6feb;"
+                "color:#444;font-size:13px;line-height:1.6;border-radius:4px")
+    st_ul = "margin:0 0 4px;padding-left:18px;font-size:14px;line-height:1.75;color:#333"
+    st_li = "margin:2px 0"
+    st_p = "margin:6px 0;font-size:13px;line-height:1.7;color:#555"
+    st_hr = "border:none;border-top:1px solid #e5e7eb;margin:16px 0 10px"
+
     def inline(text: str) -> str:
-        """转义 HTML 特殊字符并还原加粗，防止正文里的 < > 破坏结构。"""
-        return re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", html_lib.escape(text, quote=False))
+        """转义 HTML 特殊字符、还原加粗、把裸链接变成可点的 a 标签。"""
+        out = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", html_lib.escape(text, quote=False))
+        # 报告里的公告原文链接是裸 URL，转成链接并允许断行，否则手机上会撑破版心
+        return re.sub(r"(https?://[^\s<]+)",
+                      r'<a href="\1" style="color:#2f6feb;word-break:break-all">\1</a>', out)
 
     lines = md.splitlines()
     out: list[str] = []
@@ -861,41 +873,22 @@ def report_to_html(md: str) -> str:
             i += 1
             continue
         if stripped.startswith("## "):
-            out.append("<h2>%s</h2>" % inline(stripped[3:]))
+            out.append('<div style="%s">%s</div>' % (st_h2, inline(stripped[3:])))
         elif stripped.startswith("# "):
-            out.append("<h1>%s</h1>" % inline(stripped[2:]))
+            out.append('<div style="%s">%s</div>' % (st_h1, inline(stripped[2:])))
         elif stripped.startswith(">"):
-            out.append("<blockquote>%s</blockquote>" % inline(stripped[1:].strip()))
-        elif stripped.startswith("|"):
-            # 连续的 | 行构成一张表：首行表头，次行是 | --- | 分隔行，其余为数据行
-            block: list[str] = []
-            while i < len(lines) and lines[i].strip().startswith("|"):
-                block.append(lines[i].strip())
-                i += 1
-            rows = [[c.strip() for c in r.strip("|").split("|")] for r in block]
-            if len(rows) >= 2 and all(set(c) <= set("-: ") for c in rows[1]):
-                head, body = rows[0], rows[2:]
-            else:
-                head, body = [], rows
-            parts = ["<table border='1' cellspacing='0' cellpadding='4'>"]
-            if head:
-                parts.append("<tr>%s</tr>" % "".join("<th>%s</th>" % inline(c) for c in head))
-            for r in body:
-                parts.append("<tr>%s</tr>" % "".join("<td>%s</td>" % inline(c) for c in r))
-            parts.append("</table>")
-            out.append("".join(parts))
-            continue
+            out.append('<div style="%s">%s</div>' % (st_quote, inline(stripped[1:].strip())))
         elif stripped.startswith("- "):
             items: list[str] = []
             while i < len(lines) and lines[i].strip().startswith("- "):
-                items.append("<li>%s</li>" % inline(lines[i].strip()[2:]))
+                items.append('<li style="%s">%s</li>' % (st_li, inline(lines[i].strip()[2:])))
                 i += 1
-            out.append("<ul>%s</ul>" % "".join(items))
+            out.append('<ul style="%s">%s</ul>' % (st_ul, "".join(items)))
             continue
         elif stripped == "---":
-            out.append("<hr/>")
+            out.append('<hr style="%s"/>' % st_hr)
         else:
-            out.append("<p>%s</p>" % inline(stripped))
+            out.append('<p style="%s">%s</p>' % (st_p, inline(stripped)))
         i += 1
     return "\n".join(out)
 
