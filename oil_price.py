@@ -2,7 +2,7 @@
 任务名称
 name: 国内油价速报
 定时规则
-cron: 44 17 * * *
+cron: 0 17 * * *
 
 每日油价速报：抓取国家发改委成品油调价公告，生成本轮调价日历、幅度、每升折算，
 并按公告自述的计价规则预估下一轮调价的方向与幅度。
@@ -93,9 +93,13 @@ REPORT_GRADES = ("92", "95", "0")
 LITER_PER_TON = {"gas": GRADE_LITER_PER_TON["92"], "diesel": GRADE_LITER_PER_TON["0"]}
 GAS_QUALITY_RATIO = GRADE_RATIO["92"]
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
-# 覆盖通知渠道类型时用的类型名（QLAPI notificationInfo.type），默认 pushplus；
-# 换渠道后把它改成对应枚举即可，无需改推送逻辑
-NOTIFY_TYPE = os.environ.get("NOTIFY_TYPE", "").strip() or "pushplus"
+# 通知渠道类型（QLAPI notificationInfo.type）。取值必须与青龙面板「通知设置」里已启用的渠道
+# 完全一致，且**大小写敏感**：官方枚举为 pushPlus、telegramBot、dingtalkBot、weWorkBot、
+# weWorkApp、feishu、bark、serverChan、pushDeer、gotify、goCqHttpBot、iGot、email、pushMe、
+# webhook、chronocat、ntfy、wxPusherBot、wxPusherSpt、wpush、aibotk、wePlusBot、chat。
+# 写成小写 pushplus 会让青龙返回 code=400「通知发送失败，请检查系统设置/通知配置」。
+# 留空则不传 notificationInfo，直接使用面板配置（此时 Markdown 由面板模板设置决定）。
+NOTIFY_TYPE = os.environ.get("NOTIFY_TYPE", "").strip() or "pushPlus"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
@@ -833,11 +837,13 @@ def notify(title: str, content: str) -> str:
     以后换渠道只改面板即可；QLAPI 不可用时（面板外运行）退回 QINGLONG_WEBHOOK。
     返回一句结果说明，写进日志便于排错。
 
-    Markdown 渲染问题：QLAPI.systemNotify 不传 notificationInfo 时，
-    pushplus 这类渠道会按默认的 html 模板收稿，把 Markdown 当纯文本显示。
-    因此这里按 QLAPI 协议补一个 notificationInfo（pushplus 相关字段留空，
-    表示仍用面板里存的配置），只用来声明 template=markdown。
-    注意：推送结果仍以 code=200 为准，若渠道不支持该字段则不会生效。
+    两级尝试：
+      1. 带 notificationInfo（type=NOTIFY_TYPE、template=markdown），让 pushPlus 等渠道按
+         Markdown 渲染。type 必须与面板已启用的渠道完全一致且大小写相同，否则青龙返回
+         code=400「通知发送失败，请检查系统设置/通知配置」。
+      2. 第 1 步失败时去掉 notificationInfo 重发一次——官方文档写明「不传时使用面板配置」，
+         只要面板「系统设置 → 通知设置」配好就一定能发出去（模板也由面板决定）。
+    两级都失败时把两段错误一起返回，便于区分是渠道名写错还是面板没配。
     """
     # 官方文档未给 Python 的导入方式，这里两种都试：规范入口是 ql 模块，
     # 旧版执行器则把 QLAPI 直接注入为内置对象（普通解释器里不存在，按名字安全查找）
@@ -848,21 +854,27 @@ def notify(title: str, content: str) -> str:
         qlapi = globals().get("QLAPI") or getattr(builtins, "QLAPI", None)
 
     if qlapi is not None:
-        # notificationInfo 覆盖项：内容模板用 markdown；其余字段留空沿用面板配置，
-        # 这样换渠道时不用改脚本
-        params = {
-            "title": title,
-            "content": content,
-            "notificationInfo": {"type": NOTIFY_TYPE, "template": "markdown"},
-        }
-        try:
-            resp = qlapi.systemNotify(params)
-            code = resp.get("code") if isinstance(resp, dict) else None
-            if code == 200:
-                return "已通过青龙通知推送（template=markdown）"
-            return "青龙通知返回异常：%s" % resp
-        except Exception as exc:
-            return "青龙通知调用失败：%r" % exc
+        attempts: list[tuple[str, dict]] = []
+        if NOTIFY_TYPE:
+            # 声明渠道与 Markdown 模板；其余字段留空，沿用面板里该渠道已存的配置
+            attempts.append((
+                "指定渠道 %s + template=markdown" % NOTIFY_TYPE,
+                {"title": title, "content": content,
+                 "notificationInfo": {"type": NOTIFY_TYPE, "template": "markdown"}},
+            ))
+        attempts.append(("面板默认通知配置", {"title": title, "content": content}))
+
+        errors: list[str] = []
+        for desc, params in attempts:
+            try:
+                resp = qlapi.systemNotify(params)
+            except Exception as exc:
+                errors.append("%s → 调用异常 %r" % (desc, exc))
+                continue
+            if isinstance(resp, dict) and resp.get("code") == 200:
+                return "已通过青龙通知推送（%s）" % desc
+            errors.append("%s → %s" % (desc, resp))
+        return "青龙通知推送失败（已试 %d 种方式）：%s" % (len(attempts), "；".join(errors))
 
     webhook = os.environ.get("QINGLONG_WEBHOOK", "").strip()
     if webhook:
