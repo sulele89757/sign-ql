@@ -31,7 +31,7 @@ cron: 0 17 * * *
   python tools/oil_price/oil_price.py --province shaanxi   # 附带陕西官方每升调幅
   python tools/oil_price/oil_price.py --province guangdong # 附带广东官方每升价
   python tools/oil_price/oil_price.py --no-crude   # 跳过外盘行情
-  python tools/oil_price/oil_price.py --notify     # 同时推送青龙通知（Markdown 正文）
+  python tools/oil_price/oil_price.py --notify     # 同时推送青龙通知（正文默认转成 HTML）
 
 青龙面板里运行时会自动带上 --notify（见文件末尾 __main__ 分支）；面板外运行时若设置了
 QINGLONG_WEBHOOK 环境变量，则改为向该 webhook 推送，否则只打印不通知。
@@ -42,6 +42,7 @@ from __future__ import annotations
 import argparse
 import builtins
 import datetime as dt
+import html as html_lib
 import json
 import os
 import re
@@ -101,7 +102,15 @@ CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
 # 把环境变量显式设为空字符串（NOTIFY_TYPE=）则完全不传 notificationInfo，一切按面板
 # 「通知设置」里的渠道与模板走——面板的 pushplus 模板键名是 pushplusTemplate 而非
 # template，传 notificationInfo 反而可能把面板配置盖掉，排查渲染问题时优先用这种模式。
-NOTIFY_TYPE = os.environ.get("NOTIFY_TYPE", "pushPlus").strip()
+# 一般不用设置：留空表示不传 notificationInfo，渠道与模板完全按面板「通知设置」走。
+# 只有确实需要强制指定渠道时才设置，且大小写必须与官方枚举一致（如 pushPlus、telegramBot）。
+# 注意传了 notificationInfo 会整体替换面板配置，缺 token 时青龙返回 code=400。
+NOTIFY_TYPE = os.environ.get("NOTIFY_TYPE", "").strip()
+# 推送正文格式。青龙内置的 pushplus 渠道实际按 html 模板投递（面板里的 pushplusTemplate
+# 字段没有生效：实测直接把 Markdown 发过去，手机端显示成一堆 # 和 | 的源码），
+# 因此默认先把报告转成 HTML 再发；换成 Telegram、飞书等原生支持 Markdown 的渠道时，
+# 把本变量设为 markdown 即可原样发送。
+NOTIFY_TEMPLATE = os.environ.get("NOTIFY_TEMPLATE", "html").strip().lower()
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
@@ -832,6 +841,65 @@ def render(notices: list[dict], cycle: dict, realized: dict, crude: list[dict], 
     return "\n".join(lines)
 
 
+def report_to_html(md: str) -> str:
+    """把 render() 产出的 Markdown 报告转成最小 HTML。
+
+    只覆盖 render() 实际用到的语法：一级/二级标题、引用块、无序列表、表格、加粗、
+    分隔线、普通段落。不做通用 Markdown 解析——报告是我们自己拼的，语法集合封闭，
+    这里按行处理足够，也避免引入第三方依赖。
+    """
+    def inline(text: str) -> str:
+        """转义 HTML 特殊字符并还原加粗，防止正文里的 < > 破坏结构。"""
+        return re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", html_lib.escape(text, quote=False))
+
+    lines = md.splitlines()
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        stripped = lines[i].strip()
+        if not stripped:
+            i += 1
+            continue
+        if stripped.startswith("## "):
+            out.append("<h2>%s</h2>" % inline(stripped[3:]))
+        elif stripped.startswith("# "):
+            out.append("<h1>%s</h1>" % inline(stripped[2:]))
+        elif stripped.startswith(">"):
+            out.append("<blockquote>%s</blockquote>" % inline(stripped[1:].strip()))
+        elif stripped.startswith("|"):
+            # 连续的 | 行构成一张表：首行表头，次行是 | --- | 分隔行，其余为数据行
+            block: list[str] = []
+            while i < len(lines) and lines[i].strip().startswith("|"):
+                block.append(lines[i].strip())
+                i += 1
+            rows = [[c.strip() for c in r.strip("|").split("|")] for r in block]
+            if len(rows) >= 2 and all(set(c) <= set("-: ") for c in rows[1]):
+                head, body = rows[0], rows[2:]
+            else:
+                head, body = [], rows
+            parts = ["<table border='1' cellspacing='0' cellpadding='4'>"]
+            if head:
+                parts.append("<tr>%s</tr>" % "".join("<th>%s</th>" % inline(c) for c in head))
+            for r in body:
+                parts.append("<tr>%s</tr>" % "".join("<td>%s</td>" % inline(c) for c in r))
+            parts.append("</table>")
+            out.append("".join(parts))
+            continue
+        elif stripped.startswith("- "):
+            items: list[str] = []
+            while i < len(lines) and lines[i].strip().startswith("- "):
+                items.append("<li>%s</li>" % inline(lines[i].strip()[2:]))
+                i += 1
+            out.append("<ul>%s</ul>" % "".join(items))
+            continue
+        elif stripped == "---":
+            out.append("<hr/>")
+        else:
+            out.append("<p>%s</p>" % inline(stripped))
+        i += 1
+    return "\n".join(out)
+
+
 def notify(title: str, content: str) -> str:
     """推送通知。
 
@@ -839,14 +907,15 @@ def notify(title: str, content: str) -> str:
     以后换渠道只改面板即可；QLAPI 不可用时（面板外运行）退回 QINGLONG_WEBHOOK。
     返回一句结果说明，写进日志便于排错。
 
-    两级尝试：
-      1. 带 notificationInfo（type=NOTIFY_TYPE、template=markdown），让 pushPlus 等渠道按
-         Markdown 渲染。type 必须与面板已启用的渠道完全一致且大小写相同，否则青龙返回
-         code=400「通知发送失败，请检查系统设置/通知配置」。
-      2. 第 1 步失败时去掉 notificationInfo 重发一次——官方文档写明「不传时使用面板配置」，
-         只要面板「系统设置 → 通知设置」配好就一定能发出去（模板也由面板决定）。
+    默认不传 notificationInfo，渠道与模板全部按面板「通知设置」走：传了 notificationInfo
+    会整体替换面板配置，缺 token 等字段时青龙直接返回 code=400，反而发不出去。
+    只有显式设置了 NOTIFY_TYPE 时才先试一次带 notificationInfo 的调用，失败再回落面板配置。
     两级都失败时把两段错误一起返回，便于区分是渠道名写错还是面板没配。
     """
+    # 正文格式：青龙的 pushplus 渠道实际按 html 模板投递（面板里的 pushplusTemplate 不生效），
+    # Markdown 会被当纯文本显示成一堆 # 和 |，所以默认先转成 HTML 再发
+    if NOTIFY_TEMPLATE == "html":
+        content = report_to_html(content)
     # 官方文档未给 Python 的导入方式，这里两种都试：规范入口是 ql 模块，
     # 旧版执行器则把 QLAPI 直接注入为内置对象（普通解释器里不存在，按名字安全查找）
     qlapi = None
