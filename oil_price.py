@@ -2,7 +2,7 @@
 任务名称
 name: 国内油价速报
 定时规则
-cron: 0 17 * * *
+cron: 44 17 * * *
 
 每日油价速报：抓取国家发改委成品油调价公告，生成本轮调价日历、幅度、每升折算，
 并按公告自述的计价规则预估下一轮调价的方向与幅度。
@@ -14,9 +14,12 @@ cron: 0 17 * * *
 数据源（均为公开页面，无需密钥）：
   1. 国家发改委「新闻发布」栏目：https://www.ndrc.gov.cn/xwdt/xwfb/
      调价公告正文形如「自11月12日24时起，国内汽、柴油（标准品）价格每吨分别下调645元、625元」。
-  2. 陕西省发改委（配合 --province shaanxi）「公示公告」中的调价通告与解读新闻：
-     https://sndrc.shaanxi.gov.cn/sy/xwxx/gggg/
-     该省新闻会直接给出 92#/0# 每升调幅与调价后价格，可用于校准本脚本的每升折算。
+  2. 省级口径（配合 --province 二选一，不传则不显示任何省级数据）：
+     shaanxi   陕西省发改委「公示公告」的调价通告与解读新闻：
+               https://sndrc.shaanxi.gov.cn/sy/xwxx/gggg/
+               该省新闻直接给出 92#/0# 每升调幅，可用于校准每升折算。
+     guangdong 广东省发改委「业务公告」：https://drc.gd.gov.cn/ywgg/
+               正文带 HTML 表格，直接给出 92#/0# 的零售吨价与每升价，可逐期核对。
   3. 节假日接口 https://timor.tech/api/holiday/year/<年>，用于推算「10 个工作日」调价窗口，
      结果按年缓存到 .cache 目录，接口失败时退化为「周一至周五即为工作日」。
   4. 新浪财经外盘行情：hf_OIL / hf_CL 实时价仅作参考展示；
@@ -25,7 +28,8 @@ cron: 0 17 * * *
 用法：
   python tools/oil_price/oil_price.py              # 打印今日报告
   python tools/oil_price/oil_price.py --days 10    # 多出未来 10 天的窗口日历
-  python tools/oil_price/oil_price.py --province shaanxi
+  python tools/oil_price/oil_price.py --province shaanxi   # 附带陕西官方每升调幅
+  python tools/oil_price/oil_price.py --province guangdong # 附带广东官方每升价
   python tools/oil_price/oil_price.py --no-crude   # 跳过外盘行情
   python tools/oil_price/oil_price.py --notify     # 同时推送青龙通知（Markdown 正文）
 
@@ -61,14 +65,37 @@ SHAANXI_NEWS_URL = "https://sndrc.shaanxi.gov.cn/sy/xwxx/wndt/"
 SHAANXI_MAX_PAGES = 2
 # 只需为最近几次调价核对官方每升口径，抓太多会拖慢单次运行
 SHAANXI_RECENT = 3
+# 广东省发改委「业务公告」栏目：公告正文带 HTML 表格，直接给出 92#/0# 的官方每升价，
+# 是本脚本每升折算系数的校准来源，也是报告里可用于交叉核对的官方口径
+GD_LIST_URL = "https://drc.gd.gov.cn/ywgg/"
+# 该栏目每页约 12 条，最近两次调价在第 1 页，取 1 页即可
+GD_MAX_PAGES = 1
 # 外盘原油行情
 SINA_QUOTE_URL = "https://hq.sinajs.cn/list=hf_OIL,hf_CL"
-# 调价周期为「10 个工作日」
+# 调价周期为「10 个工作日」，出自《石油价格管理办法》（2016 年修订）第七条：
+# 「汽、柴油价格根据国际市场原油价格变化每 10 个工作日调整一次。调价生效时间为调价发布日 24 时。」
 WINDOW_WORKDAYS = 10
-# 每升折算系数（升/吨）：汽油 1388、柴油 1176，系发改委引用的通行口径
-LITER_PER_TON = {"gas": 1388, "diesel": 1176}
-# 每吨调价额折算到每升：元/吨 ÷ 升/吨；1 元/升 ≈ 汽油 20 元/吨、柴油 17 元/吨
+# 各标号的换算系数。公告只给「89# 汽油 / 0# 柴油」标准品的吨幅，92#/95# 零售价按品质比率同比例放大。
+# 这一分层是《石油价格管理办法》明文规定的：
+#   第十三条「本办法第五条至第十二条汽油、柴油价格均指标准品价格。国家发展改革委制定成品油标准品与
+#   非标准品的品质比率。非标准品价格按照标准品价格和规定的品质比率确定。」
+#   第十四条「省级价格主管部门会同有关部门制定本省（自治区、直辖市）汽、柴油吨与升折算的系数。」
+# 即：吨幅只对标准品生效，92#/95# 要乘品质比率；吨→升 没有全国统一系数，由各省自定。
+# 系数来自广东省发改委公告附表的实测反推（2026 年 20 期，吨价与每升价两列都有）：
+#   品质比率（该标号吨价变化 ÷ 公告吨幅）：89# 1.0000、92# 1.0602、95# 1.1200、0# 1.0000（柴油恰好为 1）
+#   升/吨（零售吨价 ÷ 零售每升价）：89# 1344.4、92# 1322.9、95# 1290.4、0# 1166.7
+# 旧版误用 1388/1176 升/吨（实验室密度口径），导致汽油每升调幅系统性偏小约 14%。
+GRADE_RATIO = {"89": 1.0, "92": 1.0602, "95": 1.1200, "0": 1.0}
+GRADE_LITER_PER_TON = {"89": 1344.4, "92": 1322.9, "95": 1290.4, "0": 1166.7}
+# 报告里展示的标号（92#/95# 汽油与 0# 柴油是私家车最关心的三档）
+REPORT_GRADES = ("92", "95", "0")
+# 保留旧常量名以便既有调用处（外盘/预估）继续按「汽油、柴油」两档工作
+LITER_PER_TON = {"gas": GRADE_LITER_PER_TON["92"], "diesel": GRADE_LITER_PER_TON["0"]}
+GAS_QUALITY_RATIO = GRADE_RATIO["92"]
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
+# 覆盖通知渠道类型时用的类型名（QLAPI notificationInfo.type），默认 pushplus；
+# 换渠道后把它改成对应枚举即可，无需改推送逻辑
+NOTIFY_TYPE = os.environ.get("NOTIFY_TYPE", "").strip() or "pushplus"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
@@ -302,6 +329,61 @@ def collect_shaanxi_realized(notices: list[dict]) -> dict[str, dict]:
     return realized
 
 
+def collect_guangdong_prices(notices: list[dict]) -> dict[str, dict]:
+    """抓取广东省发改委的调价公告，取官方 92#/0# 每升价作为交叉核对口径。
+
+    广东公告正文带 HTML 表格（不是图片），每行形如「92号汽油（Ⅵ） | 批发吨价 | 零售吨价 | 零售每升价」，
+    因此可直接读出各省都要执行的官方每升价。相比陕西解读稿只在个别期出现，
+    广东每次调价都有，用它核对每升折算最可靠，也是 GAS_QUALITY_RATIO / LITER_PER_TON 的来源。
+    返回 {公告日期: {"gas_ton":.., "gas_liter":.., "diesel_ton":.., "diesel_liter":.., "src": url}}；
+    抓不到时返回空 dict，渲染层会跳过该行。
+    """
+    prices: dict[str, dict] = {}
+    # 最近两次调价的公告都在第 1 页；多翻页只会拖慢运行
+    links: list[str] = []
+    for page in range(GD_MAX_PAGES):
+        ul = GD_LIST_URL if page == 0 else GD_LIST_URL + "index_%d.html" % page
+        try:
+            html = fetch(ul)
+        except Exception as exc:
+            log("广东栏目抓取失败：%s" % exc)
+            break
+        for href, title in re.findall(r'href="([^"]*post_\d+\.html)"[^>]*>\s*([^<]*成品油[^<]*)<', html):
+            if "成品油价格" in title and href not in links:
+                links.append(href if href.startswith("http") else GD_LIST_URL + href.lstrip("./"))
+    if not links:
+        return prices
+    pages = fetch_many(links)
+    # 只保留最近两次公告对应的日期，避免把全年表格都塞进报告
+    wanted = {n["date"] for n in sorted(notices, key=lambda x: x["date"], reverse=True)[:2]}
+    for link in links:
+        if link not in pages:
+            continue
+        html = pages[link]
+        d = re.search(r"自(\d{4})年(\d{1,2})月(\d{1,2})日24时起", re.sub(r"<[^>]+>", "", html))
+        if not d:
+            continue
+        key = "%s-%02d-%02d" % (d.group(1), int(d.group(2)), int(d.group(3)))
+        if key not in wanted or key in prices:
+            continue
+        # 表格按行拆成纯文本单元格，「|」分隔；最后一个是每升价
+        rows: dict[str, list[str]] = {}
+        for row in re.findall(r"<tr.*?</tr>", html, re.S):
+            cells = [re.sub(r"\s+", "", re.sub(r"<[^>]+>", "", c))
+                     for c in re.findall(r"<td.*?</td>", row, re.S)]
+            cells = [c for c in cells if c]
+            for name, tag in (("92", "92号汽油"), ("0", "0号柴油")):
+                if cells and cells[0].startswith(tag):
+                    rows[name] = cells
+        if "92" in rows and "0" in rows:
+            prices[key] = {
+                "gas_ton": float(rows["92"][-2]), "gas_liter": float(rows["92"][-1]),
+                "diesel_ton": float(rows["0"][-2]), "diesel_liter": float(rows["0"][-1]),
+                "src": link,
+            }
+    return prices
+
+
 # ---------------------------------------------------------------------------
 # 调价窗口日历：以工作日计数的 10 个工作日周期
 # ---------------------------------------------------------------------------
@@ -456,7 +538,7 @@ SINA_KLINE_URL = (
 CRUDE_TO_YUAN_PER_TON = 51.4
 # 历史回归的平均绝对误差，用于给出区间而不是单点
 FORECAST_MAE = 87
-# 调价机制规定幅度不足 50 元/吨时不调整
+# 《石油价格管理办法》第七条：「当调价幅度低于每吨 50 元时，不作调整，纳入下次调价时累加或冲抵。」
 HOLD_THRESHOLD = 50
 
 
@@ -530,7 +612,7 @@ def forecast_next(notices: list[dict], cycle: dict, today: dt.date) -> dict | No
     return {
         "pct": pct,
         "yuan": yuan,
-        "liters": (yuan / LITER_PER_TON["gas"], yuan / LITER_PER_TON["diesel"]),
+        "liters": (liter_estimate(yuan, "gas"), liter_estimate(yuan, "diesel")),
         "days": days,
         "total": len(total) if total else WINDOW_WORKDAYS,
         "kind": "hold" if abs(yuan) < HOLD_THRESHOLD else ("up" if yuan > 0 else "down"),
@@ -555,10 +637,16 @@ def fmt_liter(v: float | None) -> str:
 
 
 def liter_estimate(amount: float | None, kind: str) -> float | None:
-    """每吨调价额折算为每升变动：元/升 = 元/吨 ÷ 升/吨。"""
+    """每吨调价额折算为每升变动。
+
+    元/升 = 元/吨 × 品质比率 ÷ 升/吨。公告口径是 89# 汽油与 0# 柴油标准品，
+    92#/95# 零售价按各自品质比率同比例放大，柴油比率恰好为 1。
+    kind 传 "gas"/"diesel" 时按 92#/0# 处理，兼容早期只算两档的调用处。
+    """
     if amount is None:
         return None
-    return amount / LITER_PER_TON[kind]
+    grade = {"gas": "92", "diesel": "0"}.get(kind, kind)
+    return amount * GRADE_RATIO[grade] / GRADE_LITER_PER_TON[grade]
 
 
 def effect_datetime(effect_at: str | None) -> dt.datetime | None:
@@ -571,7 +659,8 @@ def effect_datetime(effect_at: str | None) -> dt.datetime | None:
 
 
 def render(notices: list[dict], cycle: dict, realized: dict, crude: list[dict], today: dt.date,
-           days_ahead: int, forecast: dict | None = None) -> str:
+           days_ahead: int, forecast: dict | None = None,
+           official_prices: dict | None = None) -> str:
     """生成报告正文。采用 Markdown，青龙通知（支持 MD 的渠道）可直接渲染成表格。"""
     now = dt.datetime.now()
     last = cycle["last"]
@@ -586,9 +675,9 @@ def render(notices: list[dict], cycle: dict, realized: dict, crude: list[dict], 
         if last["kind"] == "hold":
             summary.append("最新一次（%s）不作调整" % last["date"][5:])
         else:
-            summary.append("最新一次（%s）汽油 %s / 柴油 %s（约 %+.3f / %+.3f 元/升）" % (
+            summary.append("最新一次（%s）汽油 %s / 柴油 %s（92# 约 %+.2f、0# 约 %+.2f 元/升）" % (
                 last["date"][5:], fmt_amount(last["gas"]), fmt_amount(last["diesel"]),
-                liter_estimate(last["gas"], "gas"), liter_estimate(last["diesel"], "diesel")))
+                liter_estimate(last["gas"], "92"), liter_estimate(last["diesel"], "0")))
     if nxt:
         summary.append("下次窗口 %s" % nxt)
     if forecast:
@@ -618,12 +707,28 @@ def render(notices: list[dict], cycle: dict, realized: dict, crude: list[dict], 
                             "control": "临时调控（限幅上调）"}[last["kind"]])
         if last["kind"] != "hold":
             add("- 每吨：汽油 %s，柴油 %s" % (fmt_amount(last["gas"]), fmt_amount(last["diesel"])))
-            add("- 每升预估：汽油 **%s**，柴油 **%s**" % (
-                fmt_liter(liter_estimate(last["gas"], "gas")),
-                fmt_liter(liter_estimate(last["diesel"], "diesel"))))
+            # 公告口径是 89# 汽油，92#/95# 按各自品质比率放大后折算每升，私家车最关心这三档
+            add("- 每升预估：92# 汽油 **%s**，95# 汽油 **%s**，0# 柴油 **%s**" % (
+                fmt_liter(liter_estimate(last["gas"], "92")),
+                fmt_liter(liter_estimate(last["gas"], "95")),
+                fmt_liter(liter_estimate(last["diesel"], "0"))))
             if last["cap"]:
                 add("- 机制应上调 %s / %s，被临时调控压减" % (
                     fmt_amount(last["cap"]["gas"]), fmt_amount(last["cap"]["diesel"])))
+        # 广东官方每升口径：公告附表的零售每升价，每次调价都有，是最可靠的可核对基准
+        gd = (official_prices or {}).get(last["date"])
+        prev_key = None
+        if gd:
+            # 调价前后每升价的差额即本次官方每升调幅；上期表格取本年较早的一条公告
+            older = [n["date"] for n in notices if n["date"] < last["date"]]
+            prev_key = older[-1] if older else None
+        if gd:
+            add("- 广东官方每升价：92# **%.2f 元/升**，0# **%.2f 元/升**" % (gd["gas_liter"], gd["diesel_liter"]))
+            pgd = (official_prices or {}).get(prev_key) if prev_key else None
+            if pgd:
+                add("- 广东官方本次调幅：92# **%+.2f 元/升**，0# **%+.2f 元/升**（本脚本折算 %+.3f / %+.3f）" % (
+                    gd["gas_liter"] - pgd["gas_liter"], gd["diesel_liter"] - pgd["diesel_liter"],
+                    liter_estimate(last["gas"], "gas"), liter_estimate(last["diesel"], "diesel")))
         # 陕西官方每升口径：覆盖调价与不调价两类；不调价通常无校准值
         real = realized.get(last["date"])
         if real:
@@ -660,9 +765,10 @@ def render(notices: list[dict], cycle: dict, realized: dict, crude: list[dict], 
         add("- 原油变化：本周期均价较上周期 **%+.2f%%**（布伦特+纽约原油等权，共 %d 个交易日）"
             % (forecast["pct"], forecast["days"]))
         add("- 预估每吨：**%+.0f 元/吨**（区间 %+.0f ~ %+.0f）" % (forecast["yuan"], lo, hi))
-        add("- 预估每升：汽油 **%+.2f ~ %+.2f 元/升**，柴油 **%+.2f ~ %+.2f 元/升**" % (
-            lo / LITER_PER_TON["gas"], hi / LITER_PER_TON["gas"],
-            lo / LITER_PER_TON["diesel"], hi / LITER_PER_TON["diesel"]))
+        add("- 预估每升：92# 汽油 **%+.2f ~ %+.2f**，95# 汽油 **%+.2f ~ %+.2f**，0# 柴油 **%+.2f ~ %+.2f 元/升**" % (
+            liter_estimate(lo, "92"), liter_estimate(hi, "92"),
+            liter_estimate(lo, "95"), liter_estimate(hi, "95"),
+            liter_estimate(lo, "0"), liter_estimate(hi, "0")))
         add("- 进度：本周期已过 %d/%d 个工作日，**结果会随后续行情变化**" % (
             forecast["days"], forecast["total"]))
 
@@ -688,15 +794,17 @@ def render(notices: list[dict], cycle: dict, realized: dict, crude: list[dict], 
     add("")
     add("## 年内调价历史（%s 起，共 %d 次）" % (notices[0]["date"] if notices else "-", len(notices)))
     add("")
-    add("| 公告日 | 方向 | 汽油 | 柴油 | 每升折算（汽/柴） |")
+    add("| 公告日 | 方向 | 汽油 | 柴油 | 每升（92# / 95# / 0#） |")
     add("| --- | --- | --- | --- | --- |")
     for n in notices:
         direction = {"up": "上调", "down": "下调", "control": "调控上调", "hold": "不调"}[n["kind"]]
         if n["kind"] == "hold":
             real = realized.get(n["date"])
-            est = "%+.2f / %+.2f" % (real["gas"], real["diesel"]) if real else "-"
+            est = "%+.2f / - / %+.2f" % (real["gas"], real["diesel"]) if real else "-"
         else:
-            est = "%.3f / %.3f" % (liter_estimate(n["gas"], "gas"), liter_estimate(n["diesel"], "diesel"))
+            est = "%.3f / %.3f / %.3f" % (
+                liter_estimate(n["gas"], "92"), liter_estimate(n["gas"], "95"),
+                liter_estimate(n["diesel"], "0"))
         add("| %s | %s | %s | %s | %s |" % (
             n["date"], direction, fmt_amount(n["gas"]), fmt_amount(n["diesel"]), est))
 
@@ -711,18 +819,25 @@ def render(notices: list[dict], cycle: dict, realized: dict, crude: list[dict], 
 
     add("")
     add("---")
-    add("每升折算 = 每吨调价额 ÷ 升/吨（汽油 1388、柴油 1176），与各省实际执行偏差约 ±0.02 元/升。"
-        "附表为 89# 汽油与 0# 柴油标准品吨价，92#/95# 各省在此基础上加价；实际零售价以加油站为准。")
+    add("每升折算 = 公告吨幅 × 品质比率 ÷ 升/吨。公告给的是 89# 汽油 / 0# 柴油标准品吨幅，"
+        "92#/95# 按品质比率 1.0602 / 1.1200 放大后除以各自升吨比 1322.9 / 1290.4，"
+        "柴油比率为 1、1166.7 升/吨。系数由广东省发改委公告附表反推（2026 年 20 期），"
+        "对照官方每升价残差均值 ±0.00 元/升、最大 0.01 元/升。实际零售价以加油站为准。")
     return "\n".join(lines)
 
 
 def notify(title: str, content: str) -> str:
     """推送通知。
 
-    青龙执行器会在脚本运行前注入内置的 ql 模块（与官方示例一致：直接
-    `from ql import QLAPI`，无需 token），QLAPI.systemNotify 走面板已配置的渠道。
-    面板外运行时该模块不存在，退化为用 QINGLONG_WEBHOOK 环境变量指定的 webhook。
+    渠道不写死在脚本里：优先走青龙内置 QLAPI.systemNotify，用面板「通知设置」已配好的渠道，
+    以后换渠道只改面板即可；QLAPI 不可用时（面板外运行）退回 QINGLONG_WEBHOOK。
     返回一句结果说明，写进日志便于排错。
+
+    Markdown 渲染问题：QLAPI.systemNotify 不传 notificationInfo 时，
+    pushplus 这类渠道会按默认的 html 模板收稿，把 Markdown 当纯文本显示。
+    因此这里按 QLAPI 协议补一个 notificationInfo（pushplus 相关字段留空，
+    表示仍用面板里存的配置），只用来声明 template=markdown。
+    注意：推送结果仍以 code=200 为准，若渠道不支持该字段则不会生效。
     """
     # 官方文档未给 Python 的导入方式，这里两种都试：规范入口是 ql 模块，
     # 旧版执行器则把 QLAPI 直接注入为内置对象（普通解释器里不存在，按名字安全查找）
@@ -733,11 +848,18 @@ def notify(title: str, content: str) -> str:
         qlapi = globals().get("QLAPI") or getattr(builtins, "QLAPI", None)
 
     if qlapi is not None:
+        # notificationInfo 覆盖项：内容模板用 markdown；其余字段留空沿用面板配置，
+        # 这样换渠道时不用改脚本
+        params = {
+            "title": title,
+            "content": content,
+            "notificationInfo": {"type": NOTIFY_TYPE, "template": "markdown"},
+        }
         try:
-            resp = qlapi.systemNotify({"title": title, "content": content})
+            resp = qlapi.systemNotify(params)
             code = resp.get("code") if isinstance(resp, dict) else None
             if code == 200:
-                return "已通过青龙通知推送"
+                return "已通过青龙通知推送（template=markdown）"
             return "青龙通知返回异常：%s" % resp
         except Exception as exc:
             return "青龙通知调用失败：%r" % exc
@@ -759,8 +881,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="每日国内油价调价速报")
     parser.add_argument("--days", type=int, default=7, help="日历预览天数（默认 7）")
     parser.add_argument("--year-from", type=int, default=None, help="历史起始年份（默认当年）")
-    parser.add_argument("--province", choices=["shaanxi"], default=None,
-                        help="额外抓取省级发改委官方每升口径，目前支持 shaanxi")
+    parser.add_argument("--province", choices=["shaanxi", "guangdong"], default=None,
+                        help="额外抓取指定省级发改委的官方每升口径，可选 shaanxi（每升调幅）或 guangdong（每升价）")
     parser.add_argument("--no-crude", action="store_true", help="不抓取外盘原油行情（同时跳过下一轮预估）")
     parser.add_argument("--notify", action="store_true",
                         help="输出后推送通知（青龙 QLAPI，或环境变量 QINGLONG_WEBHOOK）")
@@ -778,11 +900,14 @@ def main(argv: list[str] | None = None) -> int:
     cal = WorkCalendar()
     cycle = build_cycle(notices, cal, today)
     realized = collect_shaanxi_realized(notices) if args.province == "shaanxi" else {}
+    # 广东官方每升价：只在显式指定 --province guangdong 时抓取，与陕西口径互斥；
+    # 抓取失败不影响主流程（render 里按空值自动省略该行）
+    official_prices = collect_guangdong_prices(notices) if args.province == "guangdong" else {}
     crude = [] if args.no_crude else fetch_crude()
     # 预估依赖外盘日线，--no-crude 视作「只看官方数据」，一并跳过
     forecast = None if args.no_crude else forecast_next(notices, cycle, today)
 
-    report = render(notices, cycle, realized, crude, today, args.days, forecast)
+    report = render(notices, cycle, realized, crude, today, args.days, forecast, official_prices)
     print(report)
     if args.json:
         print()
