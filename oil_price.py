@@ -98,8 +98,10 @@ CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
 # weWorkApp、feishu、bark、serverChan、pushDeer、gotify、goCqHttpBot、iGot、email、pushMe、
 # webhook、chronocat、ntfy、wxPusherBot、wxPusherSpt、wpush、aibotk、wePlusBot、chat。
 # 写成小写 pushplus 会让青龙返回 code=400「通知发送失败，请检查系统设置/通知配置」。
-# 留空则不传 notificationInfo，直接使用面板配置（此时 Markdown 由面板模板设置决定）。
-NOTIFY_TYPE = os.environ.get("NOTIFY_TYPE", "").strip() or "pushPlus"
+# 把环境变量显式设为空字符串（NOTIFY_TYPE=）则完全不传 notificationInfo，一切按面板
+# 「通知设置」里的渠道与模板走——面板的 pushplus 模板键名是 pushplusTemplate 而非
+# template，传 notificationInfo 反而可能把面板配置盖掉，排查渲染问题时优先用这种模式。
+NOTIFY_TYPE = os.environ.get("NOTIFY_TYPE", "pushPlus").strip()
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
