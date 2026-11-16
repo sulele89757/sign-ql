@@ -1,6 +1,15 @@
 """
+任务名称
+name: 国内油价速报
+定时规则
+cron: 0 17 * * *
+
 每日油价速报：抓取国家发改委成品油调价公告，生成本轮调价日历、幅度、每升折算，
 并按公告自述的计价规则预估下一轮调价的方向与幅度。
+
+上面的 name / cron 是青龙面板「脚本管理」识别的任务元信息（与官方示例同构）：
+把本文件上传到脚本管理后，定时任务的命令填 `task oil_price.py --notify` 即可，
+任务名与定时规则会从文件头自动带出。通知走 QLAPI.systemNotify，用面板已配置的渠道。
 
 数据源（均为公开页面，无需密钥）：
   1. 国家发改委「新闻发布」栏目：https://www.ndrc.gov.cn/xwdt/xwfb/
@@ -20,11 +29,8 @@
   python tools/oil_price/oil_price.py --no-crude   # 跳过外盘行情
   python tools/oil_price/oil_price.py --notify     # 同时推送青龙通知（Markdown 正文）
 
-青龙面板：脚本内容粘贴到「脚本管理」，定时规则建议 `0 17 * * *`（每天 17:00，
-调价公告一般在 17:00 前后发布）；须勾选任务命令行末尾的 --notify 参数：
-  task oil_price.py --notify --province shaanxi
-通知走面板已经配好的渠道（QLAPI.systemNotify），无需额外配置；
-面板外运行时若设置了 QINGLONG_WEBHOOK 环境变量，则改为向该 webhook 推送。
+青龙面板里运行时会自动带上 --notify（见文件末尾 __main__ 分支）；面板外运行时若设置了
+QINGLONG_WEBHOOK 环境变量，则改为向该 webhook 推送，否则只打印不通知。
 """
 
 from __future__ import annotations
@@ -713,14 +719,19 @@ def render(notices: list[dict], cycle: dict, realized: dict, crude: list[dict], 
 def notify(title: str, content: str) -> str:
     """推送通知。
 
-    优先使用青龙面板注入的内置对象 QLAPI（仅在面板任务执行器中可用），
-    走面板「通知设置」已配置的渠道；命令行运行时该变量不存在，
-    退化为用 QINGLONG_WEBHOOK 环境变量指定的 webhook（兼容 Server酱等 URL 推送）。
+    青龙执行器会在脚本运行前注入内置的 ql 模块（与官方示例一致：直接
+    `from ql import QLAPI`，无需 token），QLAPI.systemNotify 走面板已配置的渠道。
+    面板外运行时该模块不存在，退化为用 QINGLONG_WEBHOOK 环境变量指定的 webhook。
     返回一句结果说明，写进日志便于排错。
     """
-    # 该名称由青龙执行器注入（面板内置变量，无需 import），普通解释器里不存在，
-    # 因此不能直接写 QLAPI 否则会 NameError，只能按名字安全地查找
-    qlapi = globals().get("QLAPI") or getattr(builtins, "QLAPI", None)
+    # 官方文档未给 Python 的导入方式，这里两种都试：规范入口是 ql 模块，
+    # 旧版执行器则把 QLAPI 直接注入为内置对象（普通解释器里不存在，按名字安全查找）
+    qlapi = None
+    try:
+        from ql import QLAPI as qlapi  # type: ignore[no-redef]
+    except Exception:
+        qlapi = globals().get("QLAPI") or getattr(builtins, "QLAPI", None)
+
     if qlapi is not None:
         try:
             resp = qlapi.systemNotify({"title": title, "content": content})
@@ -743,7 +754,8 @@ def notify(title: str, content: str) -> str:
     return "未检测到青龙环境，跳过通知（仅打印到日志）"
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    """生成并打印报告；argv 为 None 时解析命令行参数，便于被青龙入口脚本以固定参数调用。"""
     parser = argparse.ArgumentParser(description="每日国内油价调价速报")
     parser.add_argument("--days", type=int, default=7, help="日历预览天数（默认 7）")
     parser.add_argument("--year-from", type=int, default=None, help="历史起始年份（默认当年）")
@@ -753,7 +765,7 @@ def main() -> int:
     parser.add_argument("--notify", action="store_true",
                         help="输出后推送通知（青龙 QLAPI，或环境变量 QINGLONG_WEBHOOK）")
     parser.add_argument("--json", action="store_true", help="同时输出 JSON 以便二次处理")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     today = dt.date.today()
     year_from = args.year_from or today.year
@@ -790,4 +802,10 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # 由青龙面板执行器运行时，ql 模块（或内置 QLAPI）存在，说明这次是要推送报告的任务，
+    # 自动补上 --notify，省得在面板命令里再写一遍；命令行手动运行时保持原样，只打印不打扰。
+    _args = sys.argv[1:]
+    if "--notify" not in _args and (getattr(builtins, "QLAPI", None) is not None
+                                    or "ql" in sys.modules):
+        _args.append("--notify")
+    sys.exit(main(_args))
