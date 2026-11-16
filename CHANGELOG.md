@@ -22,6 +22,11 @@
 
 ### 修复
 
+- oil_price.py：修复推送正文块与块之间间距过大的问题。
+  - 原因：pushplus 的 html 模板会把正文里的换行原样替换成 `<br>`，`report_to_html()` 用 `"\n".join()` 拼接，导致每个块之间多出一个 `<br>`，即多空一行。压缩 CSS `margin` 无效，因为空行是 `<br>` 撑出来的。
+  - 变更：改为 `"".join(out)`，生成的 HTML 单行输出，块间距完全由行内 `margin` 控制。
+  - 影响面：`report_to_html()` 输出；青龙推送与 pushplus 网页版观感。`NOTIFY_TEMPLATE=markdown` 路径不受影响。
+  - 迁移：无需迁移。
 - 3dmgame.py：修复 3DM 论坛签到脚本报错 `3dmgame论坛用户信息获取失败：list index out of range`。
   - 原因：站点对未携带（或携带失效）`yxd_token` cookie 的请求返回 156 字节的 JS 引导页（写入 `yxd_token` 后跳回原地址）。脚本不执行 JS，直接解析该页导致所有 xpath 取空，`user_info()` 抛 `IndexError`，而 `check_task()`、`check_task_doing()` 则误报“没有可接任务 / 没有进行中的任务”，整轮执行为空跑。
   - 变更：新增统一请求入口 `ThreeDMGame.request()`，自动解析引导页中的 `yxd_token` 写回 Cookie 请求头并重试（最多 3 次，间隔 1 秒）；响应正文同时出现「您需要先登录」与 `id="messagetext"` 提示框（Discuz 掉登录态提示页）时抛出 `CookieInvalid`，由调用方给出明确提示。原有 `self.session.get/post` 调用点全部改为走该入口；主流程按账号隔离异常，单个账号失败不再中断后续账号。

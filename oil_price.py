@@ -972,7 +972,10 @@ def report_to_html(md: str) -> str:
         else:
             out.append('<p style="%s">%s</p>' % (st_p, inline(stripped)))
         i += 1
-    return "\n".join(out)
+    # 必须拼成一行：pushplus 的 html 模板会把正文里的换行原样替换成 <br>，
+    # 每个块之间多一个 <br> 就等于多空一行——这才是「间距还是很大」的真凶，
+    # 与 CSS 的 margin 无关（把 margin 从 22px 压到 14px 也看不出变化）。
+    return "".join(out)
 
 
 def notify(title: str, content: str) -> str:
