@@ -87,12 +87,21 @@ WINDOW_WORKDAYS = 10
 #   升/吨（零售吨价 ÷ 零售每升价）：89# 1344.4、92# 1322.9、95# 1290.4、0# 1166.7
 # 旧版误用 1388/1176 升/吨（实验室密度口径），导致汽油每升调幅系统性偏小约 14%。
 GRADE_RATIO = {"89": 1.0, "92": 1.0602, "95": 1.1200, "0": 1.0}
-GRADE_LITER_PER_TON = {"89": 1344.4, "92": 1322.9, "95": 1290.4, "0": 1166.7}
+# 升/吨 是省级系数（第十四条），各省不同，同一省内汽油各标号取同一系数：
+#   广东：由公告附表 20 期「零售吨价 ÷ 零售每升价」反推，三档齐全，最可靠
+#   陕西：由官方每升调幅反推（-645 元/吨 → 92# -0.51、-625 元/吨 → 0# -0.53），与官方数吻合
+# 同一个 -645 元/吨，广东折算 -0.52、陕西折算 -0.51，差的 0.01 元/升就是这 1.4% 的系数差；
+# 95# 差得更明显（-0.56 与 -0.54），因为广东对 95# 另有一套更小的升/吨比。
+LITER_BASIS = {
+    "guangdong": {"89": 1344.4, "92": 1322.9, "95": 1290.4, "0": 1166.7},
+    "shaanxi": {"89": 1340.8, "92": 1340.8, "95": 1340.8, "0": 1179.2},
+}
+# 报告尾部要写清用的是哪一套系数，否则用户对照本省 App 会以为算错
+LITER_BASIS_LABEL = {"guangdong": "广东", "shaanxi": "陕西"}
+# 当前生效的升/吨系数，main() 按 --province 切换；不传时用广东（三档都经过验证）
+GRADE_LITER_PER_TON = dict(LITER_BASIS["guangdong"])
 # 报告里展示的标号（92#/95# 汽油与 0# 柴油是私家车最关心的三档）
 REPORT_GRADES = ("92", "95", "0")
-# 保留旧常量名以便既有调用处（外盘/预估）继续按「汽油、柴油」两档工作
-LITER_PER_TON = {"gas": GRADE_LITER_PER_TON["92"], "diesel": GRADE_LITER_PER_TON["0"]}
-GAS_QUALITY_RATIO = GRADE_RATIO["92"]
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
 # 通知渠道类型（QLAPI notificationInfo.type）。取值必须与青龙面板「通知设置」里已启用的渠道
 # 完全一致，且**大小写敏感**：官方枚举为 pushPlus、telegramBot、dingtalkBot、weWorkBot、
@@ -301,7 +310,8 @@ def collect_shaanxi_realized(notices: list[dict]) -> dict[str, dict]:
       - 公示公告 SHAANXI_LIST_URL（文件通告，多数只给执行时间）
       - 委内动态 SHAANXI_NEWS_URL（记者解读稿，含「92号汽油……每升分别下调0.51元」）
     只处理最近 SHAANXI_RECENT 次公告：更早的历史调价无人关心，抓全部会让单次运行多花半分钟。
-    返回 {公告日期: {"gas": 0.51, "diesel": 0.53, "src": url}}；抓不到时返回空 dict，
+    返回 {公告日期: {"gas": 0.51, "diesel": 0.53, "gas_liter": 8.25, "diesel_liter": 7.94, "src": url}}；
+    每升价是该次调价后的实际零售价，只有部分期次出现；抓不到时返回空 dict，
     渲染层会跳过该行，不影响主流程。
     """
     realized: dict[str, dict] = {}
@@ -340,7 +350,16 @@ def collect_shaanxi_realized(notices: list[dict]) -> dict[str, dict]:
         key = "%s-%02d-%02d" % (d.group(1), int(d.group(2)), int(d.group(3)))
         if key in wanted and key not in realized:
             sign = -1 if m.group(1) == "下调" else 1
-            realized[key] = {"gas": sign * float(m.group(2)), "diesel": sign * float(m.group(3)), "src": link}
+            item = {"gas": sign * float(m.group(2)), "diesel": sign * float(m.group(3)), "src": link}
+            # 同一段还给了调价后的实际零售价：「92号汽油西安市场每吨10998元（8.25元/升）」
+            # 用「每吨…元（…元/升）」当锚点，避免匹配到前一句「每升分别下调0.51元」
+            # 陕西不公布 95#/98#，只有这两档能拿到官方每升价
+            for field, name in (("gas_liter", "92号汽油"), ("diesel_liter", "0号柴油")):
+                # 字符类排除逗号句号，避免从上一句「0号柴油最高零售价格……0.53元，」一路懒匹配到汽油的括号
+                lm = re.search(name + r"[^（(，,。；;]*?每吨\d+元[（(]([\d.]+)元/升", body)
+                if lm:
+                    item[field] = float(lm.group(1))
+            realized[key] = item
     return realized
 
 
@@ -659,7 +678,7 @@ def liter_estimate(amount: float | None, kind: str) -> float | None:
 
 def render(notices: list[dict], cycle: dict, realized: dict, crude: list[dict], today: dt.date,
            days_ahead: int, forecast: dict | None = None,
-           official_prices: dict | None = None) -> str:
+           official_prices: dict | None = None, province: str = "") -> str:
     """生成报告正文。采用 Markdown，手机端优先：不用表格，一律「标签：值」列表。
 
     结构分三层：顶部引用块是「价格牌」（下次何时调、调多少、折成每升多少），
@@ -764,7 +783,7 @@ def render(notices: list[dict], cycle: dict, realized: dict, crude: list[dict], 
         real = realized.get(last["date"])
         if gd or real:
             add("")
-            add("## 官方口径核对（最近一次 %s）" % last["date"])
+            add("## 当前零售价与官方调幅（%s）" % last["date"])
             add("")
             if gd:
                 older = [n["date"] for n in notices if n["date"] < last["date"]]
@@ -785,11 +804,21 @@ def render(notices: list[dict], cycle: dict, realized: dict, crude: list[dict], 
                         liter_estimate(last["gas"], "92"), liter_estimate(last["gas"], "95"),
                         liter_estimate(last["diesel"], "0")))
             if real:
-                # 陕西只公布 92#/0# 两档，95# 按品质比率从 92# 推算，标注为推算值避免误当官方数
-                add("- 陕西最高零售价调幅：92# **%+.2f**、0# **%+.2f** 元/升；"
+                # 陕西只公布 92#/0# 两档，95# 的零售价与调幅都按品质比率从 92# 放大，
+                # 标注为推算值，避免被当成官方数字
+                r95 = real["gas"] * GRADE_RATIO["95"] / GRADE_RATIO["92"]
+                price = []
+                if "gas_liter" in real:
+                    price.append("92# **%.2f**" % real["gas_liter"])
+                    price.append("95# 约 **%.2f**" % (
+                        real["gas_liter"] * GRADE_RATIO["95"] / GRADE_RATIO["92"]))
+                if "diesel_liter" in real:
+                    price.append("0# **%.2f**" % real["diesel_liter"])
+                if price:
+                    add("- 陕西当前零售价（西安）：%s 元/升" % "、".join(price))
+                add("- 陕西本次调幅：92# **%+.2f**、0# **%+.2f** 元/升；"
                     "95# 未公布（按品质比率推算约 **%+.2f**）" % (
-                        real["gas"], real["diesel"],
-                        real["gas"] * GRADE_RATIO["95"] / GRADE_RATIO["92"]))
+                        real["gas"], real["diesel"], r95))
             add("- 公告原文：%s" % last["url"])
 
     add("")
@@ -823,11 +852,14 @@ def render(notices: list[dict], cycle: dict, realized: dict, crude: list[dict], 
     add("---")
     # 口径说明原来是一整段 200 余字的长句，手机上是一堵墙；拆成三行短句，事实一条不减
     add("每升折算 = 公告吨幅 × 品质比率 ÷ 升/吨。公告给的是 89# 汽油 / 0# 柴油标准品吨幅，"
-        "92#/95# 按品质比率 1.0602 / 1.1200 放大后除以各自升吨比 1322.9 / 1290.4，"
-        "柴油比率为 1、1166.7 升/吨。")
+        "92#/95# 按品质比率 1.0602 / 1.1200 放大。")
     add("")
-    add("系数由广东省发改委公告附表反推（2026 年 20 期），"
-        "对照官方每升价残差均值 ±0.00 元/升、最大 0.01 元/升。")
+    # 升/吨 由各省自定（办法第十四条），同一吨幅在不同省份折出的每升数会差 0.01~0.02，
+    # 因此这里必须说明当前用的是哪一套系数，否则用户对照本省 App 会以为算错
+    add("升/吨 由省级自定（《石油价格管理办法》第十四条），本报告用%s口径："
+        "92# %.1f、95# %.1f、0# %.1f 升/吨。" % (
+            LITER_BASIS_LABEL.get(province, "广东"),
+            GRADE_LITER_PER_TON["92"], GRADE_LITER_PER_TON["95"], GRADE_LITER_PER_TON["0"]))
     add("")
     add("实际零售价以加油站为准。")
     return "\n".join(lines)
@@ -845,30 +877,31 @@ def report_to_html(md: str) -> str:
     """
     # 色板：牌底 #101820（墨蓝，比纯黑柔和，接近灯箱底）、纸白 #ffffff、细线 #eceef1、
     # 主文 #1a1f26、次文 #6b7280；涨 #c0392b、跌 #1e7a4d（印刷感，不用 UI 亮色）
-    st_plate = ("background:#101820;color:#ffffff;padding:16px 16px 15px;border-radius:3px;"
-                "margin:0 0 8px")
+    st_plate = ("background:#101820;color:#ffffff;padding:14px 14px 13px;border-radius:3px;"
+                "margin:0 0 6px")
     st_plate_k = "font-size:12px;color:rgba(255,255,255,.62);line-height:1.5"
-    st_plate_v = ("font-size:30px;font-weight:600;color:#ffffff;line-height:1.15;margin-top:6px;"
+    st_plate_v = ("font-size:30px;font-weight:600;color:#ffffff;line-height:1.15;margin-top:5px;"
                   "font-variant-numeric:tabular-nums;letter-spacing:-.01em")
-    st_plate_s = ("font-size:13px;color:rgba(255,255,255,.78);line-height:1.6;margin-top:8px;"
+    st_plate_s = ("font-size:13px;color:rgba(255,255,255,.78);line-height:1.6;margin-top:6px;"
                   "font-variant-numeric:tabular-nums")
     # 牌面里的三档每升折算：品种标签在上、数值在下，三列并排，像加油站立牌那样一排数字
     st_grade_k = "font-size:11px;color:rgba(255,255,255,.55);line-height:1.4"
     st_grade_v = ("font-size:19px;font-weight:600;color:#ffffff;line-height:1.3;"
                   "font-variant-numeric:tabular-nums")
-    # 小节标题用一条上方细线分节，不用彩色左条：左条是装饰，细线才是真正的分隔
-    st_h2 = ("font-size:13.5px;font-weight:600;color:#1a1f26;margin:22px 0 10px;"
-             "padding-top:12px;border-top:1px solid #eceef1;line-height:1.4")
+    # 小节标题用一条上方细线分节，不用彩色左条：左条是装饰，细线才是真正的分隔。
+    # 间距压到 14/10：手机上每多 10px 空白就多滑半屏，节与节之间靠细线区分已足够。
+    st_h2 = ("font-size:13.5px;font-weight:600;color:#1a1f26;margin:14px 0 8px;"
+             "padding-top:10px;border-top:1px solid #eceef1;line-height:1.4")
     # 列表不用原生圆点：一屏二三十行圆点会连成一串，看着发麻。
     # 改用左侧竖线当行首标记——每条记录都有一条短竖线，条目边界清楚；
     # 年内历史那几条按涨跌染成红绿，其余是浅灰，于是同一种结构承载了方向信息。
-    st_ul = ("margin:0;padding-left:0;list-style:none;font-size:14px;line-height:1.7;color:#1a1f26")
-    st_li = ("margin:6px 0;padding-left:10px;"
+    st_ul = ("margin:0;padding-left:0;list-style:none;font-size:14px;line-height:1.6;color:#1a1f26")
+    st_li = ("margin:4px 0;padding-left:10px;"
              "border-left:3px solid #e3e6ea;font-variant-numeric:tabular-nums")
-    st_sub = ("margin-top:3px;color:#4b5563;font-size:13px;line-height:1.55;"
+    st_sub = ("margin-top:2px;color:#4b5563;font-size:13px;line-height:1.5;"
               "font-variant-numeric:tabular-nums")
-    st_p = "margin:0 0 8px;font-size:12.5px;line-height:1.7;color:#6b7280"
-    st_hr = "border:none;border-top:1px solid #eceef1;margin:22px 0 14px"
+    st_p = "margin:0 0 6px;font-size:12.5px;line-height:1.6;color:#6b7280"
+    st_hr = "border:none;border-top:1px solid #eceef1;margin:16px 0 10px"
 
     def inline(text: str) -> str:
         """转义 HTML 特殊字符、还原加粗、把裸链接变成可点的 a 标签，并按箭头给涨跌配色。"""
@@ -1015,6 +1048,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     today = dt.date.today()
+    # 吨→升 系数按省份切换：陕西口径由官方每升调幅反推，广东口径由公告附表反推。
+    # 同一个 -645 元/吨 在两省折出 -0.51 与 -0.52，差异来自系数而非吨幅，必须先定口径再算。
+    if args.province in LITER_BASIS:
+        GRADE_LITER_PER_TON.update(LITER_BASIS[args.province])
     year_from = args.year_from or today.year
     log("抓取发改委调价公告（%d 年起）…" % year_from)
     notices = collect_ndrc(year_from)
@@ -1032,7 +1069,8 @@ def main(argv: list[str] | None = None) -> int:
     # 预估依赖外盘日线，--no-crude 视作「只看官方数据」，一并跳过
     forecast = None if args.no_crude else forecast_next(notices, cycle, today)
 
-    report = render(notices, cycle, realized, crude, today, args.days, forecast, official_prices)
+    report = render(notices, cycle, realized, crude, today, args.days, forecast,
+                    official_prices, args.province)
     print(report)
     if args.json:
         print()
