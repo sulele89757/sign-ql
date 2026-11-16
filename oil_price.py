@@ -345,12 +345,12 @@ def collect_shaanxi_realized(notices: list[dict]) -> dict[str, dict]:
 
 
 def collect_guangdong_prices(notices: list[dict]) -> dict[str, dict]:
-    """抓取广东省发改委的调价公告，取官方 92#/0# 每升价作为交叉核对口径。
+    """抓取广东省发改委的调价公告，取官方 92#/95#/0# 每升价作为交叉核对口径。
 
     广东公告正文带 HTML 表格（不是图片），每行形如「92号汽油（Ⅵ） | 批发吨价 | 零售吨价 | 零售每升价」，
-    因此可直接读出各省都要执行的官方每升价。相比陕西解读稿只在个别期出现，
-    广东每次调价都有，用它核对每升折算最可靠，也是 GAS_QUALITY_RATIO / LITER_PER_TON 的来源。
-    返回 {公告日期: {"gas_ton":.., "gas_liter":.., "diesel_ton":.., "diesel_liter":.., "src": url}}；
+    因此可直接读出各省都要执行的官方每升价。相比陕西解读稿只给 92#/0# 两档且个别期才出现，
+    广东每次调价都有三档，用它核对每升折算最可靠，也是 GRADE_RATIO / GRADE_LITER_PER_TON 的来源。
+    返回 {公告日期: {"gas_ton","gas_liter","gas95_ton","gas95_liter","diesel_ton","diesel_liter","src"}}；
     抓不到时返回空 dict，渲染层会跳过该行。
     """
     prices: dict[str, dict] = {}
@@ -387,15 +387,20 @@ def collect_guangdong_prices(notices: list[dict]) -> dict[str, dict]:
             cells = [re.sub(r"\s+", "", re.sub(r"<[^>]+>", "", c))
                      for c in re.findall(r"<td.*?</td>", row, re.S)]
             cells = [c for c in cells if c]
-            for name, tag in (("92", "92号汽油"), ("0", "0号柴油")):
+            for name, tag in (("92", "92号汽油"), ("95", "95号汽油"), ("0", "0号柴油")):
                 if cells and cells[0].startswith(tag):
                     rows[name] = cells
         if "92" in rows and "0" in rows:
-            prices[key] = {
+            item = {
                 "gas_ton": float(rows["92"][-2]), "gas_liter": float(rows["92"][-1]),
                 "diesel_ton": float(rows["0"][-2]), "diesel_liter": float(rows["0"][-1]),
                 "src": link,
             }
+            # 95# 是后补的核对档，个别期表格缺行时不影响 92#/0# 的可用性
+            if "95" in rows:
+                item["gas95_ton"] = float(rows["95"][-2])
+                item["gas95_liter"] = float(rows["95"][-1])
+            prices[key] = item
     return prices
 
 
@@ -639,18 +644,6 @@ def forecast_next(notices: list[dict], cycle: dict, today: dt.date) -> dict | No
 # ---------------------------------------------------------------------------
 
 
-def fmt_amount(v: float | None) -> str:
-    if v is None:
-        return "-"
-    return "%+.0f 元/吨" % v
-
-
-def fmt_liter(v: float | None) -> str:
-    if v is None:
-        return "-"
-    return "%+.3f 元/升" % v
-
-
 def liter_estimate(amount: float | None, kind: str) -> float | None:
     """每吨调价额折算为每升变动。
 
@@ -664,128 +657,140 @@ def liter_estimate(amount: float | None, kind: str) -> float | None:
     return amount * GRADE_RATIO[grade] / GRADE_LITER_PER_TON[grade]
 
 
-def effect_datetime(effect_at: str | None) -> dt.datetime | None:
-    """把公告的「YYYY-MM-DD 24:00」转成真实生效时刻（次日 00:00）。"""
-    if not effect_at:
-        return None
-    day, _, clock = effect_at.partition(" ")
-    hour, _, minute = clock.partition(":")
-    return dt.datetime.fromisoformat(day) + dt.timedelta(hours=int(hour), minutes=int(minute))
-
-
 def render(notices: list[dict], cycle: dict, realized: dict, crude: list[dict], today: dt.date,
            days_ahead: int, forecast: dict | None = None,
            official_prices: dict | None = None) -> str:
-    """生成报告正文。采用 Markdown，青龙通知（支持 MD 的渠道）可直接渲染成表格。"""
+    """生成报告正文。采用 Markdown，手机端优先：不用表格，一律「标签：值」列表。
+
+    结构分三层：顶部引用块是「价格牌」（下次何时调、调多少、折成每升多少），
+    转 HTML 时按行序渲染成深色牌面；中间是分节明细；末尾是折算口径。
+    """
     now = dt.datetime.now()
     last = cycle["last"]
     nxt = cycle["next"]
     lines = []
     add = lines.append
-    add("# 国内成品油调价速报（%s）" % now.strftime("%Y-%m-%d %H:%M"))
 
-    # 顶部一句话摘要：先给结论，细节放后面
-    summary = []
-    if last:
-        if last["kind"] == "hold":
-            summary.append("最新一次（%s）不作调整" % last["date"][5:])
-        else:
-            summary.append("最新一次（%s）汽油 %s / 柴油 %s（92# 约 %+.2f、0# 约 %+.2f 元/升）" % (
-                last["date"][5:], fmt_amount(last["gas"]), fmt_amount(last["diesel"]),
-                liter_estimate(last["gas"], "92"), liter_estimate(last["diesel"], "0")))
-    if nxt:
-        summary.append("下次窗口 %s" % nxt)
-    if forecast:
-        summary.append("预估%s %+.0f 元/吨" % (
-            {"up": "上调", "down": "下调", "hold": "搁浅"}[forecast["kind"]], forecast["yuan"]))
-    if summary:
-        add("")
-        add("> " + "；".join(summary))
-
-    add("")
-    add("## 最近一次调价")
-    add("")
-    if last:
-        # 公告「24 时起执行」即次日零点生效；公告日当天下午发布，用生效时刻判断当前是否已执行
-        eff = effect_datetime(last["effect_at"])
-        if eff is None:
-            when = "-"
-        elif now >= eff:
-            when = "已生效"
-        elif eff.date() <= today:
-            when = "今日 24 时生效"
-        else:
-            when = "待生效"
-        add("- 公告日期：%s（%s）" % (last["date"], when))
-        add("- 生效时间：%s" % (last["effect_at"] or "-"))
-        add("- 方式：%s" % {"up": "上调", "down": "下调", "hold": "不作调整",
-                            "control": "临时调控（限幅上调）"}[last["kind"]])
-        if last["kind"] != "hold":
-            add("- 每吨：汽油 %s，柴油 %s" % (fmt_amount(last["gas"]), fmt_amount(last["diesel"])))
-            # 公告口径是 89# 汽油，92#/95# 按各自品质比率放大后折算每升，私家车最关心这三档
-            add("- 每升预估：92# 汽油 **%s**，95# 汽油 **%s**，0# 柴油 **%s**" % (
-                fmt_liter(liter_estimate(last["gas"], "92")),
-                fmt_liter(liter_estimate(last["gas"], "95")),
-                fmt_liter(liter_estimate(last["diesel"], "0"))))
-            if last["cap"]:
-                add("- 机制应上调 %s / %s，被临时调控压减" % (
-                    fmt_amount(last["cap"]["gas"]), fmt_amount(last["cap"]["diesel"])))
-        # 广东官方每升口径：公告附表的零售每升价，每次调价都有，是最可靠的可核对基准
-        gd = (official_prices or {}).get(last["date"])
-        prev_key = None
-        if gd:
-            # 调价前后每升价的差额即本次官方每升调幅；上期表格取本年较早的一条公告
-            older = [n["date"] for n in notices if n["date"] < last["date"]]
-            prev_key = older[-1] if older else None
-        if gd:
-            add("- 广东官方每升价：92# **%.2f 元/升**，0# **%.2f 元/升**" % (gd["gas_liter"], gd["diesel_liter"]))
-            pgd = (official_prices or {}).get(prev_key) if prev_key else None
-            if pgd:
-                add("- 广东官方本次调幅：92# **%+.2f 元/升**，0# **%+.2f 元/升**（本脚本折算 %+.3f / %+.3f）" % (
-                    gd["gas_liter"] - pgd["gas_liter"], gd["diesel_liter"] - pgd["diesel_liter"],
-                    liter_estimate(last["gas"], "gas"), liter_estimate(last["diesel"], "diesel")))
-        # 陕西官方每升口径：覆盖调价与不调价两类；不调价通常无校准值
-        real = realized.get(last["date"])
-        if real:
-            add("- 陕西官方口径：92# **%+.2f 元/升**，0# **%+.2f 元/升**" % (real["gas"], real["diesel"]))
-        add("- 原文：%s" % last["url"])
-    else:
-        add("- 未获取到调价公告，请检查网络或栏目地址是否变化。")
-
-    add("")
+    # 顶部价格牌：三行引用块。第一行交代窗口与倒计时，第二行给预估吨幅（HTML 里是牌面大数字），
+    # 第三行补方向与每升折算。整份报告只在这里用重色，其余全部退成灰阶。
     if nxt:
         delta = (nxt - today).days
         if delta < 0:
-            add("## 下一个调价窗口：%s（已过窗口，公告可能未抓到，请核对发改委网站）" % nxt)
+            add("> 下次调价 %s（已过窗口，公告可能未抓到）" % nxt.isoformat())
         elif delta == 0:
-            add("## 下一个调价窗口：今天（%s）24 时，留意下午公告" % nxt)
+            add("> 下次调价 今天（%s）24 时" % nxt.isoformat())
         else:
-            add("## 下一个调价窗口：**%s（还有 %d 天）**" % (nxt, delta))
-        last_d = dt.date.fromisoformat(last["date"])
-        wd = WorkCalendar().list_workdays(last_d + dt.timedelta(days=1), nxt)
-        if wd:
-            add("")
-            add("本轮计价周期 %s ~ %s，共 %d 个工作日；窗口日以国家发改委公告为准。" % (
-                wd[0].isoformat(), wd[-1].isoformat(), len(wd)))
+            add("> 下次调价 %s 周%s · 还有 %d 天" % (
+                nxt.isoformat(), "一二三四五六日"[nxt.weekday()], delta))
+    else:
+        add("> 调价窗口无法推算")
+    if forecast:
+        add("> %+.0f 元/吨" % forecast["yuan"])
+        if forecast["kind"] == "hold":
+            # 搁浅时没有真实调幅，三档折算值等于 0，列出来只会误导，直接说明原因
+            add("> 搁浅 · 不足 50 元/吨，本轮不调整")
+        else:
+            add("> %s · 折合每升（元）" % {"up": "上调", "down": "下调"}[forecast["kind"]])
+            # 三档用全角空格分隔，转 HTML 时拆成三列并排显示，方便一眼比较 92#/95#/0# 的差异
+            add("> 92# %+.2f\u3000 95# %+.2f\u3000 0# %+.2f" % (
+                liter_estimate(forecast["yuan"], "92"), liter_estimate(forecast["yuan"], "95"),
+                liter_estimate(forecast["yuan"], "0")))
+    else:
+        add("> 待定")
+        add("> 未抓取外盘原油行情，本轮不做方向预估")
+    add("")
+    add("%s 更新" % now.strftime("%Y-%m-%d %H:%M"))
+
+    # 报告顺序：先给下一轮（用户最关心），已经发生的调价统一放进年内历史。
+    # 窗口日期与预估吨幅已由顶部价格牌交代，这里只放推算依据，避免同一结论说两遍
+    add("")
+    if nxt:
+        add("## 下一轮调价依据")
+        add("")
+        if forecast:
+            lo, hi = forecast["yuan"] - FORECAST_MAE, forecast["yuan"] + FORECAST_MAE
+            add("- 原油变化：本周期均价较上周期 %+.2f%%（布伦特+纽约等权，%d 个交易日）"
+                % (forecast["pct"], forecast["days"]))
+            add("- 吨价区间：%+.0f ~ %+.0f 元/吨" % (lo, hi))
+            add("- 每升区间：92# %+.2f ~ %+.2f、95# %+.2f ~ %+.2f、0# %+.2f ~ %+.2f" % (
+                liter_estimate(lo, "92"), liter_estimate(hi, "92"),
+                liter_estimate(lo, "95"), liter_estimate(hi, "95"),
+                liter_estimate(lo, "0"), liter_estimate(hi, "0")))
+        else:
+            add("- 方向预估：已跳过（未抓取外盘原油行情）")
+        # 周期进度按工作日算，比原油交易日数更贴合公告的「10 个工作日」口径
+        if last:
+            last_d = dt.date.fromisoformat(last["date"])
+            wd = WorkCalendar().list_workdays(last_d + dt.timedelta(days=1), nxt)
+            if wd:
+                passed = sum(1 for x in wd if x <= today)
+                add("- 周期进度：%d/%d 个工作日（%s ~ %s）" % (
+                    passed, len(wd), wd[0].isoformat(), wd[-1].isoformat()))
     else:
         add("## 无法推算调价窗口（缺少可用的调价公告）")
 
-    # 下一轮预估：方向 + 大致区间；不给单点假精确，并注明是阶段值
-    if forecast:
+    add("")
+    # 历史区先给聚合结论（几次涨、几次跌），条目里就能省掉「上调/下调」字样
+    cnt = {"up": 0, "control": 0, "down": 0, "hold": 0}
+    for n in notices:
+        cnt[n["kind"]] = cnt.get(n["kind"], 0) + 1
+    year = notices[0]["date"][:4] if notices else "-"
+    add("## 年内调价历史（%s 年，共 %d 次：%d 涨 %d 降 %d 不调）" % (
+        year, len(notices), cnt["up"] + cnt["control"], cnt["down"], cnt["hold"]))
+    add("")
+    if not notices:
+        add("- 未获取到调价公告，请检查网络或栏目地址是否变化。")
+    elif cnt["control"]:
+        add("其中 %d 次上调为调控压减后的实际上调。" % cnt["control"])
         add("")
-        add("## 下一轮预估：%s" % {"up": "倾向于上调", "down": "倾向于下调",
-                                  "hold": "大概率搁浅（不足 50 元/吨）"}[forecast["kind"]])
-        add("")
-        lo, hi = forecast["yuan"] - FORECAST_MAE, forecast["yuan"] + FORECAST_MAE
-        add("- 原油变化：本周期均价较上周期 **%+.2f%%**（布伦特+纽约原油等权，共 %d 个交易日）"
-            % (forecast["pct"], forecast["days"]))
-        add("- 预估每吨：**%+.0f 元/吨**（区间 %+.0f ~ %+.0f）" % (forecast["yuan"], lo, hi))
-        add("- 预估每升：92# 汽油 **%+.2f ~ %+.2f**，95# 汽油 **%+.2f ~ %+.2f**，0# 柴油 **%+.2f ~ %+.2f 元/升**" % (
-            liter_estimate(lo, "92"), liter_estimate(hi, "92"),
-            liter_estimate(lo, "95"), liter_estimate(hi, "95"),
-            liter_estimate(lo, "0"), liter_estimate(hi, "0")))
-        add("- 进度：本周期已过 %d/%d 个工作日，**结果会随后续行情变化**" % (
-            forecast["days"], forecast["total"]))
+    for n in notices:
+        # ▲/▼ 让涨跌一眼可辨；转 HTML 时再按箭头配色（涨红跌绿）
+        arrow = {"up": "▲", "down": "▼", "control": "▲", "hold": "—"}[n["kind"]]
+        # 同一年内只写月日，跨年才补年份：每行省 5 个字符，长条目才不至于折行
+        day = n["date"][5:] if n["date"][:4] == year else n["date"]
+        if n["kind"] == "hold":
+            add("- **%s 不调**" % day)
+            continue
+        # 一次调价写两行：第一行吨价（公告原始口径），第二行折算后的零售每升价，缩进两格归入同一条。
+        # 两行各自用「吨」「升」起头并把品种写在数字前，单位省掉，条目就短到能一行放下
+        add("- **%s %s** 吨 汽油 %+.0f / 柴油 %+.0f" % (day, arrow, n["gas"], n["diesel"]))
+        add("  升 92# %+.2f / 95# %+.2f / 0# %+.2f" % (
+            liter_estimate(n["gas"], "92"), liter_estimate(n["gas"], "95"),
+            liter_estimate(n["diesel"], "0")))
+
+    # 官方每升口径：只作交叉核对，放在历史之后；广东表三档齐全，陕西只公布 92#/0#
+    if last and (official_prices or realized):
+        gd = (official_prices or {}).get(last["date"])
+        real = realized.get(last["date"])
+        if gd or real:
+            add("")
+            add("## 官方口径核对（最近一次 %s）" % last["date"])
+            add("")
+            if gd:
+                older = [n["date"] for n in notices if n["date"] < last["date"]]
+                prev_key = older[-1] if older else None
+                pgd = (official_prices or {}).get(prev_key) if prev_key else None
+                parts = ["92# **%.2f**" % gd["gas_liter"]]
+                if "gas95_liter" in gd:
+                    parts.append("95# **%.2f**" % gd["gas95_liter"])
+                parts.append("0# **%.2f**" % gd["diesel_liter"])
+                add("- 广东最高零售价：%s 元/升" % "、".join(parts))
+                if pgd:
+                    diff = ["92# **%+.2f**" % (gd["gas_liter"] - pgd["gas_liter"])]
+                    if "gas95_liter" in gd and "gas95_liter" in pgd:
+                        diff.append("95# **%+.2f**" % (gd["gas95_liter"] - pgd["gas95_liter"]))
+                    diff.append("0# **%+.2f**" % (gd["diesel_liter"] - pgd["diesel_liter"]))
+                    add("- 广东官方本次调幅：%s 元/升（本脚本折算 %+.3f / %+.3f / %+.3f）" % (
+                        "、".join(diff),
+                        liter_estimate(last["gas"], "92"), liter_estimate(last["gas"], "95"),
+                        liter_estimate(last["diesel"], "0")))
+            if real:
+                # 陕西只公布 92#/0# 两档，95# 按品质比率从 92# 推算，标注为推算值避免误当官方数
+                add("- 陕西最高零售价调幅：92# **%+.2f**、0# **%+.2f** 元/升；"
+                    "95# 未公布（按品质比率推算约 **%+.2f**）" % (
+                        real["gas"], real["diesel"],
+                        real["gas"] * GRADE_RATIO["95"] / GRADE_RATIO["92"]))
+            add("- 公告原文：%s" % last["url"])
 
     add("")
     add("## 窗口日历（后续 %d 天）" % days_ahead)
@@ -807,21 +812,6 @@ def render(notices: list[dict], cycle: dict, realized: dict, crude: list[dict], 
         add(line)
         d += dt.timedelta(days=1)
 
-    add("")
-    add("## 年内调价历史（%s 起，共 %d 次）" % (notices[0]["date"] if notices else "-", len(notices)))
-    add("")
-    for n in notices:
-        direction = {"up": "上调", "down": "下调", "control": "调控上调", "hold": "不调"}[n["kind"]]
-        if n["kind"] == "hold":
-            # 搁浅没有幅度，也不再折算每升，避免出现一排 0 干扰阅读
-            add("- **%s %s**：本次不作调整" % (n["date"], direction))
-            continue
-        est = "92# %.3f、95# %.3f、0# %.3f 元/升" % (
-            liter_estimate(n["gas"], "92"), liter_estimate(n["gas"], "95"),
-            liter_estimate(n["diesel"], "0"))
-        add("- **%s %s**：汽油 %s、柴油 %s 元/吨；%s" % (
-            n["date"], direction, fmt_amount(n["gas"]), fmt_amount(n["diesel"]), est))
-
     if crude:
         add("")
         add("## 外盘原油（美元/桶，%s）" % crude[0]["quote_date"])
@@ -831,38 +821,64 @@ def render(notices: list[dict], cycle: dict, realized: dict, crude: list[dict], 
 
     add("")
     add("---")
+    # 口径说明原来是一整段 200 余字的长句，手机上是一堵墙；拆成三行短句，事实一条不减
     add("每升折算 = 公告吨幅 × 品质比率 ÷ 升/吨。公告给的是 89# 汽油 / 0# 柴油标准品吨幅，"
         "92#/95# 按品质比率 1.0602 / 1.1200 放大后除以各自升吨比 1322.9 / 1290.4，"
-        "柴油比率为 1、1166.7 升/吨。系数由广东省发改委公告附表反推（2026 年 20 期），"
-        "对照官方每升价残差均值 ±0.00 元/升、最大 0.01 元/升。实际零售价以加油站为准。")
+        "柴油比率为 1、1166.7 升/吨。")
+    add("")
+    add("系数由广东省发改委公告附表反推（2026 年 20 期），"
+        "对照官方每升价残差均值 ±0.00 元/升、最大 0.01 元/升。")
+    add("")
+    add("实际零售价以加油站为准。")
     return "\n".join(lines)
 
 
 def report_to_html(md: str) -> str:
     """把 render() 产出的 Markdown 报告转成最小 HTML。
 
-    只覆盖 render() 实际用到的语法：一级/二级标题、引用块、无序列表、加粗、分隔线、
-    普通段落。不做通用 Markdown 解析——报告是我们自己拼的，语法集合封闭，按行处理足够。
+    只覆盖 render() 实际用到的语法：引用块（顶部价格牌）、二级标题、无序列表、加粗、
+    分隔线、普通段落。不做通用 Markdown 解析——报告是我们自己拼的，语法集合封闭，按行处理足够。
     样式全部写成行内 style：pushplus 的 html 模板会过滤 <style> 标签，行内样式才生效。
+
+    视觉上只花一次重色：顶部引用块渲染成深色价格牌（借鉴加油站立牌：深底、白字、大数字）。
+    其余一律灰阶，涨跌红绿只出现在牌面方向词与历史条目的左侧色条上。
     """
-    # 各元素的行内样式。手机屏宽通常 360~430px，字号取 15px、行高 1.7 较易读；
-    # 段落与列表留出上下间距，避免整块文字糊在一起
-    st_h1 = "font-size:18px;font-weight:600;color:#111;margin:0 0 10px;line-height:1.5"
-    st_h2 = ("font-size:15px;font-weight:600;color:#111;margin:18px 0 8px;padding-left:8px;"
-             "border-left:3px solid #2f6feb;line-height:1.4")
-    st_quote = ("margin:0 0 6px;padding:8px 10px;background:#f5f7fa;border-left:3px solid #2f6feb;"
-                "color:#444;font-size:13px;line-height:1.6;border-radius:4px")
-    st_ul = "margin:0 0 4px;padding-left:18px;font-size:14px;line-height:1.75;color:#333"
-    st_li = "margin:2px 0"
-    st_p = "margin:6px 0;font-size:13px;line-height:1.7;color:#555"
-    st_hr = "border:none;border-top:1px solid #e5e7eb;margin:16px 0 10px"
+    # 色板：牌底 #101820（墨蓝，比纯黑柔和，接近灯箱底）、纸白 #ffffff、细线 #eceef1、
+    # 主文 #1a1f26、次文 #6b7280；涨 #c0392b、跌 #1e7a4d（印刷感，不用 UI 亮色）
+    st_plate = ("background:#101820;color:#ffffff;padding:16px 16px 15px;border-radius:3px;"
+                "margin:0 0 8px")
+    st_plate_k = "font-size:12px;color:rgba(255,255,255,.62);line-height:1.5"
+    st_plate_v = ("font-size:30px;font-weight:600;color:#ffffff;line-height:1.15;margin-top:6px;"
+                  "font-variant-numeric:tabular-nums;letter-spacing:-.01em")
+    st_plate_s = ("font-size:13px;color:rgba(255,255,255,.78);line-height:1.6;margin-top:8px;"
+                  "font-variant-numeric:tabular-nums")
+    # 牌面里的三档每升折算：品种标签在上、数值在下，三列并排，像加油站立牌那样一排数字
+    st_grade_k = "font-size:11px;color:rgba(255,255,255,.55);line-height:1.4"
+    st_grade_v = ("font-size:19px;font-weight:600;color:#ffffff;line-height:1.3;"
+                  "font-variant-numeric:tabular-nums")
+    # 小节标题用一条上方细线分节，不用彩色左条：左条是装饰，细线才是真正的分隔
+    st_h2 = ("font-size:13.5px;font-weight:600;color:#1a1f26;margin:22px 0 10px;"
+             "padding-top:12px;border-top:1px solid #eceef1;line-height:1.4")
+    # 列表不用原生圆点：一屏二三十行圆点会连成一串，看着发麻。
+    # 改用左侧竖线当行首标记——每条记录都有一条短竖线，条目边界清楚；
+    # 年内历史那几条按涨跌染成红绿，其余是浅灰，于是同一种结构承载了方向信息。
+    st_ul = ("margin:0;padding-left:0;list-style:none;font-size:14px;line-height:1.7;color:#1a1f26")
+    st_li = ("margin:6px 0;padding-left:10px;"
+             "border-left:3px solid #e3e6ea;font-variant-numeric:tabular-nums")
+    st_sub = ("margin-top:3px;color:#4b5563;font-size:13px;line-height:1.55;"
+              "font-variant-numeric:tabular-nums")
+    st_p = "margin:0 0 8px;font-size:12.5px;line-height:1.7;color:#6b7280"
+    st_hr = "border:none;border-top:1px solid #eceef1;margin:22px 0 14px"
 
     def inline(text: str) -> str:
-        """转义 HTML 特殊字符、还原加粗、把裸链接变成可点的 a 标签。"""
+        """转义 HTML 特殊字符、还原加粗、把裸链接变成可点的 a 标签，并按箭头给涨跌配色。"""
         out = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", html_lib.escape(text, quote=False))
         # 报告里的公告原文链接是裸 URL，转成链接并允许断行，否则手机上会撑破版心
-        return re.sub(r"(https?://[^\s<]+)",
-                      r'<a href="\1" style="color:#2f6feb;word-break:break-all">\1</a>', out)
+        out = re.sub(r"(https?://[^\s<]+)",
+                     r'<a href="\1" style="color:#1f5fa8;word-break:break-all">\1</a>', out)
+        # 涨红跌绿（国内习惯），只给箭头本身着色，数字保持黑色以免整行发花
+        return (out.replace("▲", '<span style="color:#c0392b;font-weight:700">▲</span>')
+                   .replace("▼", '<span style="color:#1e7a4d;font-weight:700">▼</span>'))
 
     lines = md.splitlines()
     out: list[str] = []
@@ -874,15 +890,48 @@ def report_to_html(md: str) -> str:
             continue
         if stripped.startswith("## "):
             out.append('<div style="%s">%s</div>' % (st_h2, inline(stripped[3:])))
-        elif stripped.startswith("# "):
-            out.append('<div style="%s">%s</div>' % (st_h1, inline(stripped[2:])))
         elif stripped.startswith(">"):
-            out.append('<div style="%s">%s</div>' % (st_quote, inline(stripped[1:].strip())))
+            # 连续引用行合并成一块牌面，按行序分配样式：第 1 行小标签、第 2 行大数字、其余补充说明
+            block: list[str] = []
+            while i < len(lines) and lines[i].strip().startswith(">"):
+                block.append(lines[i].strip()[1:].strip())
+                i += 1
+            cells = []
+            for j, seg in enumerate(block):
+                if "\u3000" in seg:
+                    # 含全角空格的段落是三档每升折算，拆成等宽三列；
+                    # inline-block 加百分比宽度在所有手机内置浏览器里都稳定，flex 则未必
+                    cols = []
+                    for part in [p.strip() for p in seg.split("\u3000") if p.strip()]:
+                        m = re.match(r"^(\S+)\s+(.+)$", part)
+                        label, value = (m.group(1), m.group(2)) if m else ("", part)
+                        cols.append(
+                            '<div style="display:inline-block;width:33.33%%;vertical-align:top">'
+                            '<div style="%s">%s</div><div style="%s">%s</div></div>'
+                            % (st_grade_k, inline(label), st_grade_v, inline(value)))
+                    cells.append('<div style="margin-top:10px">%s</div>' % "".join(cols))
+                else:
+                    style = st_plate_k if j == 0 else (st_plate_v if j == 1 else st_plate_s)
+                    cells.append('<div style="%s">%s</div>' % (style, inline(seg)))
+            out.append('<div style="%s">%s</div>' % (st_plate, "".join(cells)))
+            continue
         elif stripped.startswith("- "):
             items: list[str] = []
             while i < len(lines) and lines[i].strip().startswith("- "):
-                items.append('<li style="%s">%s</li>' % (st_li, inline(lines[i].strip()[2:])))
+                raw = lines[i].strip()[2:]
+                inner = inline(raw)
                 i += 1
+                # 紧随其后的缩进行是同一条目的第二行（年内历史用它放零售价），并入同一个 <li>
+                cont: list[str] = []
+                while (i < len(lines) and lines[i].startswith("  ") and lines[i].strip()
+                       and not lines[i].strip().startswith("- ")):
+                    cont.append(lines[i].strip())
+                    i += 1
+                if cont:
+                    inner += "".join('<div style="%s">%s</div>' % (st_sub, inline(c)) for c in cont)
+                # 年内历史按涨跌给左侧竖线上色（涨红跌绿），其余条目保持浅灰
+                bar = "#c0392b" if "▲" in raw else ("#1e7a4d" if "▼" in raw else "#e3e6ea")
+                items.append('<li style="%s;border-left-color:%s">%s</li>' % (st_li, bar, inner))
             out.append('<ul style="%s">%s</ul>' % (st_ul, "".join(items)))
             continue
         elif stripped == "---":
