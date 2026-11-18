@@ -876,8 +876,13 @@ def report_to_html(md: str) -> str:
     其余一律灰阶，涨跌红绿只出现在牌面方向词与历史条目的左侧色条上。
     """
     # 色板：牌底 #101820（墨蓝，比纯黑柔和，接近灯箱底）、纸白 #ffffff、细线 #eceef1、
-    # 主文 #1a1f26、次文 #6b7280；涨 #c0392b、跌 #1e7a4d（印刷感，不用 UI 亮色）
-    st_plate = ("background:#101820;color:#ffffff;padding:14px 14px 13px;border-radius:3px;"
+    # 主文 #1a1f26、次文 #6b7280；涨 #c0392b、跌 #1e7a4d（印刷感，不用 UI 亮色）。
+    # 微信 / QQ 内置浏览器在手机深色模式下会给无色容器套暗底浅字；只写 color 时
+    # 主文仍是接近黑色的 #1a1f26，落在暗底上几乎看不清。所以所有容器成对写
+    # background 与 color，并用 color-scheme:only light 声明本块自带固定浅色配色，
+    # 阻止浏览器自动反色。
+    st_root = "color-scheme:only light"
+    st_plate = (st_root + ";background:#101820;color:#ffffff;padding:14px 14px 13px;border-radius:3px;"
                 "margin:0 0 6px")
     st_plate_k = "font-size:12px;color:rgba(255,255,255,.62);line-height:1.5"
     st_plate_v = ("font-size:30px;font-weight:600;color:#ffffff;line-height:1.15;margin-top:5px;"
@@ -890,18 +895,18 @@ def report_to_html(md: str) -> str:
                   "font-variant-numeric:tabular-nums")
     # 小节标题用一条上方细线分节，不用彩色左条：左条是装饰，细线才是真正的分隔。
     # 间距压到 14/10：手机上每多 10px 空白就多滑半屏，节与节之间靠细线区分已足够。
-    st_h2 = ("font-size:13.5px;font-weight:600;color:#1a1f26;margin:14px 0 8px;"
+    st_h2 = (st_root + ";font-size:13.5px;font-weight:600;color:#1a1f26;margin:14px 0 8px;"
              "padding-top:10px;border-top:1px solid #eceef1;line-height:1.4")
     # 列表不用原生圆点：一屏二三十行圆点会连成一串，看着发麻。
     # 改用左侧竖线当行首标记——每条记录都有一条短竖线，条目边界清楚；
     # 年内历史那几条按涨跌染成红绿，其余是浅灰，于是同一种结构承载了方向信息。
-    st_ul = ("margin:0;padding-left:0;list-style:none;font-size:14px;line-height:1.6;color:#1a1f26")
+    st_ul = (st_root + ";background:#ffffff;margin:0;padding-left:0;list-style:none;font-size:14px;line-height:1.6;color:#1a1f26")
     st_li = ("margin:4px 0;padding-left:10px;"
              "border-left:3px solid #e3e6ea;font-variant-numeric:tabular-nums")
     st_sub = ("margin-top:2px;color:#4b5563;font-size:13px;line-height:1.5;"
               "font-variant-numeric:tabular-nums")
-    st_p = "margin:0 0 6px;font-size:12.5px;line-height:1.6;color:#6b7280"
-    st_hr = "border:none;border-top:1px solid #eceef1;margin:16px 0 10px"
+    st_p = (st_root + ";margin:0 0 6px;font-size:12.5px;line-height:1.6;color:#6b7280")
+    st_hr = (st_root + ";border:none;border-top:1px solid #eceef1;margin:16px 0 10px")
 
     def inline(text: str) -> str:
         """转义 HTML 特殊字符、还原加粗、把裸链接变成可点的 a 标签，并按箭头给涨跌配色。"""
