@@ -877,11 +877,10 @@ def report_to_html(md: str) -> str:
     """
     # 色板：牌底 #101820（墨蓝，比纯黑柔和，接近灯箱底）、纸白 #ffffff、细线 #eceef1、
     # 主文 #1a1f26、次文 #6b7280；涨 #c0392b、跌 #1e7a4d（印刷感，不用 UI 亮色）。
-    # 微信 / QQ 内置浏览器在手机深色模式下会给无色容器套暗底浅字；只写 color 时
-    # 主文仍是接近黑色的 #1a1f26，落在暗底上几乎看不清。所以所有容器成对写
-    # background 与 color，并用 color-scheme:only light 声明本块自带固定浅色配色，
-    # 阻止浏览器自动反色。
-    st_root = "color-scheme:only light"
+    # 所有可能带文字的容器都给一整套固定浅色配色：背景、正文色、链接色，
+    # 并统一声明 color-scheme:only light。只给外层声明不够——pushplus/微信会重写
+    # p/ul 这类裸标签的样式，后代没有自己的背景和文字色时就会被套成暗底黑字。
+    st_root = "color-scheme:only light;-webkit-text-size-adjust:100%"
     st_plate = (st_root + ";background:#101820;color:#ffffff;padding:14px 14px 13px;border-radius:3px;"
                 "margin:0 0 6px")
     st_plate_k = "font-size:12px;color:rgba(255,255,255,.62);line-height:1.5"
@@ -895,25 +894,28 @@ def report_to_html(md: str) -> str:
                   "font-variant-numeric:tabular-nums")
     # 小节标题用一条上方细线分节，不用彩色左条：左条是装饰，细线才是真正的分隔。
     # 间距压到 14/10：手机上每多 10px 空白就多滑半屏，节与节之间靠细线区分已足够。
-    st_h2 = (st_root + ";font-size:13.5px;font-weight:600;color:#1a1f26;margin:14px 0 8px;"
-             "padding-top:10px;border-top:1px solid #eceef1;line-height:1.4")
+    st_h2 = (st_root + ";background:#ffffff;color:#1a1f26;font-size:13.5px;font-weight:600;"
+             "margin:14px 0 8px;padding:10px 0;border-top:1px solid #d9dde3;line-height:1.4")
     # 列表不用原生圆点：一屏二三十行圆点会连成一串，看着发麻。
     # 改用左侧竖线当行首标记——每条记录都有一条短竖线，条目边界清楚；
     # 年内历史那几条按涨跌染成红绿，其余是浅灰，于是同一种结构承载了方向信息。
-    st_ul = (st_root + ";background:#ffffff;margin:0;padding-left:0;list-style:none;font-size:14px;line-height:1.6;color:#1a1f26")
-    st_li = ("margin:4px 0;padding-left:10px;"
-             "border-left:3px solid #e3e6ea;font-variant-numeric:tabular-nums")
-    st_sub = ("margin-top:2px;color:#4b5563;font-size:13px;line-height:1.5;"
+    st_ul = (st_root + ";background:#ffffff;margin:0;padding-left:0;list-style:none;"
+             "font-size:14px;line-height:1.6;color:#1a1f26")
+    st_li = ("background:#ffffff;color:#1a1f26;margin:4px 0;padding:2px 0 2px 10px;"
+             "border-left:3px solid #c8ced6;font-variant-numeric:tabular-nums")
+    st_sub = ("background:#ffffff;color:#374151;font-size:13px;line-height:1.5;"
               "font-variant-numeric:tabular-nums")
-    st_p = (st_root + ";margin:0 0 6px;font-size:12.5px;line-height:1.6;color:#6b7280")
-    st_hr = (st_root + ";border:none;border-top:1px solid #eceef1;margin:16px 0 10px")
+    st_p = (st_root + ";background:#ffffff;margin:0 0 6px;padding:2px 0;font-size:12.5px;"
+            "line-height:1.6;color:#374151")
+    st_hr = (st_root + ";background:#ffffff;border:none;border-top:1px solid #c8ced6;"
+             "margin:16px 0 10px")
 
     def inline(text: str) -> str:
         """转义 HTML 特殊字符、还原加粗、把裸链接变成可点的 a 标签，并按箭头给涨跌配色。"""
         out = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", html_lib.escape(text, quote=False))
         # 报告里的公告原文链接是裸 URL，转成链接并允许断行，否则手机上会撑破版心
         out = re.sub(r"(https?://[^\s<]+)",
-                     r'<a href="\1" style="color:#1f5fa8;word-break:break-all">\1</a>', out)
+                     r'<a href="\1" style="color:#0b4f9e;text-decoration:underline;word-break:break-all">\1</a>', out)
         # 涨红跌绿（国内习惯），只给箭头本身着色，数字保持黑色以免整行发花
         return (out.replace("▲", '<span style="color:#c0392b;font-weight:700">▲</span>')
                    .replace("▼", '<span style="color:#1e7a4d;font-weight:700">▼</span>'))
@@ -968,7 +970,7 @@ def report_to_html(md: str) -> str:
                 if cont:
                     inner += "".join('<div style="%s">%s</div>' % (st_sub, inline(c)) for c in cont)
                 # 年内历史按涨跌给左侧竖线上色（涨红跌绿），其余条目保持浅灰
-                bar = "#c0392b" if "▲" in raw else ("#1e7a4d" if "▼" in raw else "#e3e6ea")
+                bar = "#b3261e" if "▲" in raw else ("#0f6b3d" if "▼" in raw else "#c8ced6")
                 items.append('<li style="%s;border-left-color:%s">%s</li>' % (st_li, bar, inner))
             out.append('<ul style="%s">%s</ul>' % (st_ul, "".join(items)))
             continue

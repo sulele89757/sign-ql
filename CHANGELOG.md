@@ -32,6 +32,11 @@
   - 变更：所有块级容器成对写 `background` 与 `color`，列表块固定 `#ffffff` + `#1a1f26`，并在行内 `style` 加 `color-scheme:only light` 声明固定浅色配色，阻止浏览器自动反色。
   - 影响面：`report_to_html()` 输出的 HTML；青龙推送与 pushplus 网页版观感。`NOTIFY_TEMPLATE=markdown` 路径不受影响。
   - 迁移：无需迁移。
+- oil_price.py：再次修复手机深色模式下推送正文文字与背景对比不足的问题。
+  - 原因：微信 / QQ 内置浏览器在深色模式会给没有背景的元素套暗底浅字，还会重写裸 `p` / `ul` 标签；此前只在最外层写 `color-scheme:only light`，正文仍可能变成「暗底黑字」。
+  - 变更：每个可能带文字的容器（列表块、`li`、续行、段落、分割线、小节标题）单独写 `background` 与 `color`，并重复 `color-scheme:only light`；链接改为更深的 `#0b4f9e`，次要文字改 `#374151`，细线与色条提高对比度。
+  - 影响面：`report_to_html()` 输出的 HTML；青龙推送与 pushplus 网页版观感。`NOTIFY_TEMPLATE=markdown` 路径不受影响。
+  - 迁移：无需迁移。
 - 3dmgame.py：修复 3DM 论坛签到脚本报错 `3dmgame论坛用户信息获取失败：list index out of range`。
   - 原因：站点对未携带（或携带失效）`yxd_token` cookie 的请求返回 156 字节的 JS 引导页（写入 `yxd_token` 后跳回原地址）。脚本不执行 JS，直接解析该页导致所有 xpath 取空，`user_info()` 抛 `IndexError`，而 `check_task()`、`check_task_doing()` 则误报“没有可接任务 / 没有进行中的任务”，整轮执行为空跑。
   - 变更：新增统一请求入口 `ThreeDMGame.request()`，自动解析引导页中的 `yxd_token` 写回 Cookie 请求头并重试（最多 3 次，间隔 1 秒）；响应正文同时出现「您需要先登录」与 `id="messagetext"` 提示框（Discuz 掉登录态提示页）时抛出 `CookieInvalid`，由调用方给出明确提示。原有 `self.session.get/post` 调用点全部改为走该入口；主流程按账号隔离异常，单个账号失败不再中断后续账号。
